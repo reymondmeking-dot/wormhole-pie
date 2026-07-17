@@ -21,9 +21,11 @@ import {
   FileImage,
   FileText,
   Folder,
+  FolderOutput,
   Home,
   Lightbulb,
   Layers3,
+  Languages,
   Link2,
   LogOut,
   MessageCircle,
@@ -50,6 +52,7 @@ import {
   AnimationEvent as ReactAnimationEvent,
   CSSProperties,
   FormEvent,
+  MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
@@ -59,12 +62,14 @@ import {
   useState,
 } from "react";
 import { MinimalDialogue } from "./components/MinimalDialogue";
+import { AgentManagerPanel } from "./components/AgentManagerPanel";
 import { HomeSectionFrame, HomeSectionRail } from "./components/HomeSectionRail";
 import type { HomeSectionId, HomeSectionMotion } from "./components/HomeSectionRail";
 import { WormholeTransition } from "./components/WormholeTransition";
 import type { WindowMotion } from "./components/WormholeTransition";
 import { mockFiles, seedIdeas, seedNotices, seedTodos } from "./data/mockData";
 import { usePersistentState } from "./hooks/usePersistentState";
+import { useDocumentLanguage, type AppLocale } from "./i18n";
 import { PetSprite } from "./pet/PetSprite";
 import type { PetAnimationLoopBoundaryEvent } from "./pet/PetSprite";
 import { getPetAssetId, getPetFrameSrc, loadPetManifests } from "./pet/petManifest";
@@ -106,6 +111,7 @@ import {
   recognizeLocalSpeech,
   removeOrganizeExclusion,
   reviewDesktopOrganize,
+  restoreLibraryItemsToDesktop,
   runAgentTask,
   scanDesktopFiles,
   sendDialogueCommand,
@@ -113,6 +119,7 @@ import {
   setPetVisibility,
   setDesktopIconsHidden,
   setWindowLogicalPosition,
+  showMainFromTray,
   showPetContextMenu,
   showPetDialogue,
   startDesktopWatcher,
@@ -562,6 +569,8 @@ function FileTypeIcon({ file, size = 16 }: { file: DesktopFile; size?: number })
 type HeaderProps = {
   unread: number;
   menuOpen: boolean;
+  locale: AppLocale;
+  onLocale: (locale: AppLocale) => void;
   onNotifications: () => void;
   onMenu: () => void;
   onSettings: () => void;
@@ -571,7 +580,7 @@ type HeaderProps = {
   onQuit: () => void;
 };
 
-function WidgetHeader({ unread, menuOpen, onNotifications, onMenu, onSettings, onPetSettings, onExclusions, onMinimize, onQuit }: HeaderProps) {
+function WidgetHeader({ unread, menuOpen, locale, onLocale, onNotifications, onMenu, onSettings, onPetSettings, onExclusions, onMinimize, onQuit }: HeaderProps) {
   const dragHandlers = useDraggableWindow(true);
   return (
     <header
@@ -585,6 +594,15 @@ function WidgetHeader({ unread, menuOpen, onNotifications, onMenu, onSettings, o
       </div>
       <div className="widget-header-actions">
         <span className="offline-state"><i />本地</span>
+        <button
+          className="header-language"
+          type="button"
+          onClick={() => onLocale(locale === "zh-CN" ? "en-US" : "zh-CN")}
+          aria-label={locale === "zh-CN" ? "切换为英文" : "Switch to Chinese"}
+          title={locale === "zh-CN" ? "English" : "中文"}
+        >
+          <Languages size={13} /><span>{locale === "zh-CN" ? "EN" : "中"}</span>
+        </button>
         <button className="header-icon collapse-button" onClick={onMinimize} aria-label="向上收起到系统托盘" title="收起到系统托盘">
           <ChevronUp size={18} />
         </button>
@@ -895,6 +913,8 @@ type FilesViewProps = {
   onOpen: (file: DesktopFile) => void;
   onLaunchProgram: (program: ProgramEntry) => void;
   onCategory: (id: DesktopFile["id"], category: string) => void;
+  onRestore: (files: DesktopFile[]) => void;
+  restoring: boolean;
 };
 
 type LibraryQuickEntry =
@@ -962,7 +982,9 @@ function LibraryQuickSidebar({ files, programs, programsLoading, filter, onFilte
   );
 }
 
-function FilesView({ files, programs, programsLoading, arrangeMode, query, filter, onQuery, onFilter, onArrangeMode, onBack, onOpen, onLaunchProgram, onCategory }: FilesViewProps) {
+function FilesView({ files, programs, programsLoading, arrangeMode, query, filter, onQuery, onFilter, onArrangeMode, onBack, onOpen, onLaunchProgram, onCategory, onRestore, restoring }: FilesViewProps) {
+  const [contextMenu, setContextMenu] = useState<{ file: DesktopFile; x: number; y: number } | null>(null);
+  const [confirmRestoreAll, setConfirmRestoreAll] = useState(false);
   const filtered = useMemo(() => files.filter((file) => {
     const physicalCategory = inferOrganizedCategory(file);
     const matchesText = !query || `${file.name} ${file.category} ${physicalCategory}`.toLowerCase().includes(query.toLowerCase());
@@ -979,6 +1001,28 @@ function FilesView({ files, programs, programsLoading, arrangeMode, query, filte
     });
   }, [files, filter, programs, query]);
   const itemCount = filtered.length + visiblePrograms.length;
+  const organizedFiles = useMemo(() => files.filter(isOrganizedFile), [files]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("blur", close);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (!confirmRestoreAll) return;
+    const timer = window.setTimeout(() => setConfirmRestoreAll(false), 4_000);
+    return () => window.clearTimeout(timer);
+  }, [confirmRestoreAll]);
+
+  const openFileMenu = (event: ReactMouseEvent, file: DesktopFile) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ file, x: Math.min(event.clientX, window.innerWidth - 176), y: Math.min(event.clientY, window.innerHeight - 112) });
+  };
   const groupedItems = useMemo(() => {
     const items = [
       ...filtered.map((file) => ({ kind: "file" as const, name: file.name, category: inferOrganizedCategory(file), createdAt: file.createdAt ?? 0, file })),
@@ -1037,6 +1081,22 @@ function FilesView({ files, programs, programsLoading, arrangeMode, query, filte
               </select>
               <ChevronRight size={13} />
             </label>
+            <button
+              type="button"
+              className={`restore-all-library ${confirmRestoreAll ? "is-confirming" : ""}`}
+              disabled={restoring || !organizedFiles.length}
+              onClick={() => {
+                if (!confirmRestoreAll) {
+                  setConfirmRestoreAll(true);
+                  return;
+                }
+                setConfirmRestoreAll(false);
+                onRestore(organizedFiles);
+              }}
+            >
+              <FolderOutput size={13} />
+              {confirmRestoreAll ? `确认撤回 ${organizedFiles.length} 项` : "一键撤回到桌面"}
+            </button>
           </div>
           <div className="full-file-list">
           {groupedItems.map((group) => (
@@ -1061,7 +1121,7 @@ function FilesView({ files, programs, programsLoading, arrangeMode, query, filte
                   ? file.createdAt ? `创建 ${relativeTime(file.createdAt)}` : "创建时间未知"
                   : relativeTime(file.modifiedAt);
                 return (
-                  <article className="full-file-row" key={file.id}>
+                  <article className="full-file-row" key={file.id} onContextMenu={(event) => openFileMenu(event, file)}>
                     <button className="full-file-open" onClick={() => onOpen(file)}>
                       <FileTypeIcon file={file} size={17} />
                       <span><strong>{file.name}</strong><small><em>{item.category}</em>{isOrganizedFile(file) ? "已整理" : "桌面"} · {timeLabel}</small></span>
@@ -1071,6 +1131,7 @@ function FilesView({ files, programs, programsLoading, arrangeMode, query, filte
                         {tagOptions.map((tag) => <option key={tag}>{tag}</option>)}
                       </select>
                     </label>
+                    <button className="file-row-more" type="button" onClick={(event) => openFileMenu(event, file)} aria-label={`${file.name} 更多操作`}><MoreHorizontal size={15} /></button>
                   </article>
                 );
               })}
@@ -1083,6 +1144,14 @@ function FilesView({ files, programs, programsLoading, arrangeMode, query, filte
         </div>
         <LibraryQuickSidebar files={files} programs={programs} programsLoading={programsLoading} filter={filter} onFilter={onFilter} onOpen={onOpen} onLaunchProgram={onLaunchProgram} />
       </div>
+      {contextMenu ? (
+        <div className="file-context-menu" style={{ left: contextMenu.x, top: contextMenu.y }} role="menu" onClick={(event) => event.stopPropagation()}>
+          <button type="button" role="menuitem" onClick={() => { onOpen(contextMenu.file); setContextMenu(null); }}><ExternalLink size={14} />打开</button>
+          {isOrganizedFile(contextMenu.file) ? (
+            <button type="button" role="menuitem" disabled={restoring} onClick={() => { onRestore([contextMenu.file]); setContextMenu(null); }}><FolderOutput size={14} />撤回到桌面</button>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -1287,6 +1356,7 @@ function RestSettingsSheet({
 }
 
 type PetSettingsProps = {
+  locale: AppLocale;
   name: string;
   species: PetSpecies;
   theme: PetTheme;
@@ -1321,6 +1391,7 @@ type PetSettingsProps = {
 };
 
 function PetSettingsSheet({
+  locale,
   name,
   species,
   theme,
@@ -1448,11 +1519,14 @@ function PetSettingsSheet({
               {connectorsLoading ? "正在识别 Claude、Hermes 和 Codex…" : connectorScanMessage}
             </p>
           ) : null}
-          <label className="agent-workspace-field">
-            <span>任务目录</span>
-            <input value={agentWorkspace} onChange={(event) => onAgentWorkspace(event.target.value)} spellCheck={false} aria-label="Agent 任务目录" />
-          </label>
-          <p className="agent-privacy-note">只检查命令与配置痕迹，不读取凭据内容，也不会联网验证账号。任务只交给你选择的本机 CLI；对话里不会显示终端、思考或工作流。</p>
+          <AgentManagerPanel
+            locale={locale}
+            connectors={connectors}
+            workspace={agentWorkspace}
+            onWorkspace={onAgentWorkspace}
+            onInstalled={onRefreshConnectors}
+          />
+          <p className="agent-privacy-note">凭据只在点击保存时写入所选 Agent 的默认配置；测试通断只检查接口地址，不发送密钥。任务只交给你选择的本机 CLI；对话里不会显示终端、思考或工作流。</p>
         </div>
 
         <div className="pet-setting-row">
@@ -2273,7 +2347,7 @@ function PetDialogueWindow() {
   );
 }
 
-function WidgetApplication() {
+function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: (locale: AppLocale) => void }) {
   const [activeTab, setActiveTab] = useState<WidgetTab>("home");
   const [homeLibrary, setHomeLibrary] = useState<HomeLibrary>("desktop");
   const [files, setFiles] = useState<DesktopFile[]>(isTauri() ? [] : mockFiles);
@@ -2306,6 +2380,7 @@ function WidgetApplication() {
   const agentInvokeOwnedRef = useRef(false);
   const dialogueStateRef = useRef<DialogueState>({ userMessage: "", reply: "想让我做什么？", listening: false, busy: false, connectorId: agentConnector, resultFiles: [] });
   const [isScanning, setIsScanning] = useState(false);
+  const [restoringLibrary, setRestoringLibrary] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [socialSettingsOpen, setSocialSettingsOpen] = useState(false);
@@ -3541,6 +3616,7 @@ function WidgetApplication() {
       setFileQuery(keyword);
       setFileFilter("all");
       setActiveTab("files");
+      await showMainFromTray().catch(console.error);
       setAssistantMessage(candidates.length ? `找到 ${candidates.length} 个相似项，选一个吧。` : `没有找到「${keyword}」。`);
       sendMainPetSignal(candidates.length ? "task_completed" : "task_failed", { source: "system" });
       return;
@@ -3583,6 +3659,25 @@ function WidgetApplication() {
       setIsListening(false);
     }
   };
+
+  const handleRestoreLibraryItems = useCallback(async (selectedFiles: DesktopFile[]) => {
+    const organized = selectedFiles.filter(isOrganizedFile);
+    if (!organized.length || restoringLibrary) return;
+    setRestoringLibrary(true);
+    try {
+      const result = await restoreLibraryItemsToDesktop(organized.map((file) => file.path));
+      if (!result.restoredCount) throw new Error("没有找到可撤回的资料库项目，请刷新文件列表后重试。");
+      await loadFiles(true);
+      const conflictText = result.conflictCount ? `；${result.conflictCount} 个重名项目已自动改名` : "";
+      setAssistantMessage(`已撤回 ${result.restoredCount} 个项目到桌面${conflictText}。`);
+      addNotice("文件已撤回桌面", `${result.restoredCount} 个项目已安全放回桌面${conflictText}。`, "action");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setAssistantMessage(message || "文件暂时没能撤回桌面。");
+    } finally {
+      setRestoringLibrary(false);
+    }
+  }, [addNotice, loadFiles, restoringLibrary]);
 
   const categoryChange = (fileId: DesktopFile["id"], category: string) => {
     setFiles((current) => {
@@ -3692,6 +3787,8 @@ function WidgetApplication() {
         <WidgetHeader
           unread={unread}
           menuOpen={menuOpen}
+          locale={locale}
+          onLocale={onLocale}
           onNotifications={() => { setNotificationsOpen(true); setMenuOpen(false); }}
           onMenu={() => setMenuOpen((value) => !value)}
           onSettings={() => { setSettingsOpen(true); setMenuOpen(false); }}
@@ -3791,6 +3888,8 @@ function WidgetApplication() {
               onOpen={(file) => { setLastUserMessage(`打开「${file.name}」`); void openIndexedItem(file); }}
               onLaunchProgram={(program) => void handleLaunchProgram(program)}
               onCategory={categoryChange}
+              onRestore={(selectedFiles) => void handleRestoreLibraryItems(selectedFiles)}
+              restoring={restoringLibrary}
             />
           ) : null}
 
@@ -3848,6 +3947,7 @@ function WidgetApplication() {
 
         {petSettingsOpen ? (
           <PetSettingsSheet
+            locale={locale}
             name={petName}
             species={petSpecies}
             theme={petTheme}
@@ -3941,6 +4041,8 @@ function WidgetApplication() {
 
 function App() {
   const windowKind = new URLSearchParams(window.location.search).get("window");
+  const [locale, setLocale] = usePersistentState<AppLocale>("wormhole-pie.locale.v1", "zh-CN");
+  useDocumentLanguage(locale);
 
   useEffect(() => {
     if (!isTauri()) return;
@@ -3955,7 +4057,7 @@ function App() {
 
   if (windowKind === "pet") return <DesktopPetWindow />;
   if (windowKind === "dialogue" || windowKind === "pet-dialogue") return <PetDialogueWindow />;
-  return <WidgetApplication />;
+  return <WidgetApplication locale={locale} onLocale={setLocale} />;
 }
 
 export default App;

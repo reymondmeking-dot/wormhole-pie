@@ -6,6 +6,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     io::{ErrorKind, Read},
+    net::{TcpStream, ToSocketAddrs},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -47,6 +48,8 @@ const AGENT_OUTPUT_MAX_BYTES: usize = 128 * 1024;
 const AGENT_PROBE_OUTPUT_MAX_BYTES: usize = 8 * 1024;
 const AGENT_TASK_TIMEOUT: Duration = Duration::from_secs(12 * 60 * 60);
 const AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const AGENT_INSTALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const AGENT_INSTALL_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 const AGENT_CONNECTOR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const AGENT_TASK_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const AGENT_ATTACHMENT_MAX_COUNT: usize = 8;
@@ -262,6 +265,48 @@ struct AgentTaskStatus {
     elapsed_ms: u64,
     cancel_requested: bool,
     detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInstallRequest {
+    connector_id: String,
+    locale: String,
+    install_directory: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentInstallResult {
+    connector_id: String,
+    success: bool,
+    dependency_installed: bool,
+    executable: Option<String>,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentApiConfig {
+    connector_id: String,
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentApiTestResult {
+    reachable: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryRestoreResult {
+    restored_count: usize,
+    conflict_count: usize,
+    restored_paths: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -3154,6 +3199,168 @@ fn undo_desktop_organize(
 }
 
 #[tauri::command]
+fn restore_library_items_to_desktop(
+    paths: Vec<String>,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LibraryRestoreResult, String> {
+    if paths.is_empty() {
+        return Ok(LibraryRestoreResult {
+            restored_count: 0,
+            conflict_count: 0,
+            restored_paths: Vec::new(),
+        });
+    }
+    if paths.len() > 500 {
+        return Err("一次最多撤回 500 个项目".to_string());
+    }
+    let _operation_guard = state
+        .organize_lock
+        .lock()
+        .map_err(|_| "桌面整理操作已锁定".to_string())?;
+    let library = state
+        .index
+        .library_path
+        .canonicalize()
+        .map_err(|error| format!("无法访问资料库：{error}"))?;
+    let desktop = app
+        .path()
+        .desktop_dir()
+        .map_err(|error| format!("无法定位桌面：{error}"))?;
+    fs::create_dir_all(&desktop).map_err(|error| format!("无法访问桌面：{error}"))?;
+    let desktop = desktop
+        .canonicalize()
+        .map_err(|error| format!("无法访问桌面：{error}"))?;
+    let mut seen = HashSet::new();
+    let mut reserved = HashSet::new();
+    let mut transfers = Vec::new();
+    let mut conflict_count = 0usize;
+    let mut source_parents = Vec::new();
+
+    for raw in paths {
+        let requested = PathBuf::from(raw);
+        if !requested.is_absolute() {
+            return Err("只能撤回资料库中的绝对路径".to_string());
+        }
+        let metadata = fs::symlink_metadata(&requested)
+            .map_err(|_| "待撤回项目不存在或已被移动".to_string())?;
+        if metadata.file_type().is_symlink()
+            || is_reparse_point(&metadata)
+            || (!metadata.is_file() && !metadata.is_dir())
+        {
+            return Err("链接或特殊项目不能撤回到桌面".to_string());
+        }
+        let source = requested
+            .canonicalize()
+            .map_err(|error| format!("无法访问待撤回项目：{error}"))?;
+        let relative = source
+            .strip_prefix(&library)
+            .map_err(|_| "只能撤回虫洞派资料库中的项目".to_string())?;
+        if relative.components().count() < 2
+            || !relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err("不能直接撤回资料库根目录或分类目录".to_string());
+        }
+        if !seen.insert(agent_candidate_key(&source)) {
+            continue;
+        }
+        let name = source
+            .file_name()
+            .ok_or_else(|| "待撤回项目缺少文件名".to_string())?;
+        if desktop.join(name).exists() {
+            conflict_count += 1;
+        }
+        let destination = unique_destination(&desktop, name, metadata.is_dir(), &mut reserved)?;
+        if let Some(parent) = source.parent() {
+            source_parents.push(parent.to_path_buf());
+        }
+        transfers.push((source, destination, metadata.is_dir()));
+    }
+
+    execute_transfers(&transfers)?;
+    if let Err(error) = repath_index_transfers(&state.index, &transfers) {
+        let rollback_error = rollback_transfers(&transfers).err();
+        return Err(format!(
+            "撤回后的索引更新失败：{error}{}",
+            rollback_error
+                .map(|value| format!("；文件回滚失败：{value}"))
+                .unwrap_or_default()
+        ));
+    }
+    let reverse_index = reversed_transfers(&transfers);
+    let source_keys = transfers
+        .iter()
+        .map(|(source, _, _)| agent_candidate_key(source))
+        .collect::<HashSet<_>>();
+    let previous_batches = state
+        .organize_batches
+        .lock()
+        .map_err(|_| "桌面整理历史已锁定".to_string())?
+        .clone();
+    let mut next_batches = previous_batches.clone();
+    next_batches.iter_mut().for_each(|batch| {
+        batch
+            .moves
+            .retain(|item| !source_keys.contains(&agent_candidate_key(&item.organized)))
+    });
+    next_batches.retain(|batch| !batch.moves.is_empty());
+    if let Err(error) = persist_organize_batches(&state.index, &next_batches) {
+        let rollback_error = rollback_transfers(&transfers).err();
+        let index_error = if rollback_error.is_none() {
+            repath_index_transfers(&state.index, &reverse_index).err()
+        } else {
+            None
+        };
+        return Err(format!(
+            "撤回历史保存失败：{error}{}{}",
+            rollback_error
+                .map(|value| format!("；文件回滚失败：{value}"))
+                .unwrap_or_default(),
+            index_error
+                .map(|value| format!("；索引回滚失败：{value}"))
+                .unwrap_or_default()
+        ));
+    }
+    *state
+        .organize_batches
+        .lock()
+        .map_err(|_| "桌面整理历史已锁定".to_string())? = next_batches;
+
+    for parent in source_parents {
+        if parent.starts_with(&library) && parent != library {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+    if let Err(error) = refresh_desktop_files(&app, &state.index) {
+        append_log(
+            &state.index,
+            "restore_library_items",
+            None,
+            &desktop.to_string_lossy(),
+            &format!("refresh_failed:{error}"),
+        );
+    }
+    let restored_paths = transfers
+        .iter()
+        .map(|(_, destination, _)| destination.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    append_log(
+        &state.index,
+        "restore_library_items",
+        None,
+        &desktop.to_string_lossy(),
+        &format!("success:{}", restored_paths.len()),
+    );
+    Ok(LibraryRestoreResult {
+        restored_count: restored_paths.len(),
+        conflict_count,
+        restored_paths,
+    })
+}
+
+#[tauri::command]
 fn update_file_category(
     file_id: i64,
     category: String,
@@ -3391,77 +3598,86 @@ fn push_agent_candidate(
     }
 }
 
-fn agent_executable_file_name(kind: AgentConnectorKind) -> String {
+fn agent_executable_file_names(kind: AgentConnectorKind) -> Vec<String> {
     #[cfg(windows)]
     {
-        format!("{}.exe", kind.command_name())
+        vec![
+            format!("{}.exe", kind.command_name()),
+            format!("{}.cmd", kind.command_name()),
+            format!("{}.bat", kind.command_name()),
+        ]
     }
     #[cfg(not(windows))]
     {
-        kind.command_name().to_string()
+        vec![kind.command_name().to_string()]
     }
 }
 
 fn agent_executable_candidates(kind: AgentConnectorKind) -> Vec<PathBuf> {
-    let file_name = agent_executable_file_name(kind);
+    let file_names = agent_executable_file_names(kind);
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
 
     if let Some(path_value) = std::env::var_os("PATH") {
         for directory in std::env::split_paths(&path_value) {
-            push_agent_candidate(&mut candidates, &mut seen, directory.join(&file_name));
+            for file_name in &file_names {
+                push_agent_candidate(&mut candidates, &mut seen, directory.join(file_name));
+            }
         }
     }
 
     if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
         let home = PathBuf::from(home);
-        push_agent_candidate(
-            &mut candidates,
-            &mut seen,
-            home.join(".local").join("bin").join(&file_name),
-        );
+        for file_name in &file_names {
+            push_agent_candidate(
+                &mut candidates,
+                &mut seen,
+                home.join(".wormhole-pie")
+                    .join("agents")
+                    .join("bin")
+                    .join(file_name),
+            );
+            push_agent_candidate(
+                &mut candidates,
+                &mut seen,
+                home.join(".local").join("bin").join(file_name),
+            );
+        }
     }
 
     #[cfg(windows)]
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         let local_app_data = PathBuf::from(local_app_data);
-        match kind {
-            AgentConnectorKind::Codex => push_agent_candidate(
-                &mut candidates,
-                &mut seen,
-                local_app_data
+        for file_name in &file_names {
+            let candidate = match kind {
+                AgentConnectorKind::Codex => local_app_data
                     .join("Programs")
                     .join("Codex")
-                    .join(&file_name),
-            ),
-            AgentConnectorKind::Claude => push_agent_candidate(
-                &mut candidates,
-                &mut seen,
-                local_app_data
+                    .join(file_name),
+                AgentConnectorKind::Claude => local_app_data
                     .join("Programs")
                     .join("Claude")
-                    .join(&file_name),
-            ),
-            AgentConnectorKind::Hermes => push_agent_candidate(
-                &mut candidates,
-                &mut seen,
-                local_app_data
+                    .join(file_name),
+                AgentConnectorKind::Hermes => local_app_data
                     .join("hermes")
                     .join("hermes-agent")
                     .join("venv")
                     .join("Scripts")
-                    .join(&file_name),
-            ),
+                    .join(file_name),
+            };
+            push_agent_candidate(&mut candidates, &mut seen, candidate);
         }
     }
 
     #[cfg(target_os = "macos")]
     for directory in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-        push_agent_candidate(
-            &mut candidates,
-            &mut seen,
-            Path::new(directory).join(&file_name),
-        );
+        for file_name in &file_names {
+            push_agent_candidate(
+                &mut candidates,
+                &mut seen,
+                Path::new(directory).join(file_name),
+            );
+        }
     }
 
     candidates
@@ -3618,6 +3834,22 @@ fn sanitize_process_output(bytes: &[u8], limit: usize) -> String {
 }
 
 fn bounded_process_command(executable: &Path) -> Command {
+    #[cfg(windows)]
+    if executable
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
+    {
+        let command_shell = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        let mut command = Command::new(command_shell);
+        command.args(["/D", "/S", "/C"]).arg(executable);
+        command.creation_flags(0x0800_0000);
+        return command;
+    }
     let mut command = Command::new(executable);
     #[cfg(windows)]
     command.creation_flags(0x0800_0000);
@@ -4790,6 +5022,578 @@ fn get_agent_default_workspace(app: tauri::AppHandle) -> Result<String, String> 
 }
 
 #[tauri::command]
+fn get_agent_default_install_directory(app: tauri::AppHandle) -> Result<String, String> {
+    app.path()
+        .document_dir()
+        .map(|path| path.join("虫洞派 Agents").to_string_lossy().to_string())
+        .map_err(|error| format!("无法定位文档目录：{error}"))
+}
+
+#[tauri::command]
+fn pick_directory(app: tauri::AppHandle, title: String) -> Result<Option<String>, String> {
+    let selected = app.dialog().file().set_title(title).blocking_pick_folder();
+    selected
+        .map(|directory| {
+            directory
+                .into_path()
+                .map(|path| path.to_string_lossy().to_string())
+                .map_err(|_| "只支持选择本机目录".to_string())
+        })
+        .transpose()
+}
+
+fn validate_agent_install_directory(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.contains('"') {
+        return Err("安装目录无效".to_string());
+    }
+    let requested = PathBuf::from(trimmed);
+    if !requested.is_absolute() || requested.parent().is_none() {
+        return Err("安装目录必须是非根目录的绝对路径".to_string());
+    }
+    if let Ok(metadata) = fs::symlink_metadata(&requested) {
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Err("安装目录必须是普通文件夹".to_string());
+        }
+    } else {
+        fs::create_dir_all(&requested).map_err(|error| format!("无法创建安装目录：{error}"))?;
+    }
+    let canonical = requested
+        .canonicalize()
+        .map_err(|error| format!("无法访问安装目录：{error}"))?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err("安装目录必须是普通文件夹".to_string());
+    }
+    Ok(canonical)
+}
+
+fn executable_candidates(names: &[&str]) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            for name in names {
+                candidates.push(directory.join(name));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            let root = PathBuf::from(program_files).join("nodejs");
+            candidates.extend(names.iter().map(|name| root.join(name)));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let root = PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("Python");
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    candidates.extend(names.iter().map(|name| entry.path().join(name)));
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for directory in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+        candidates.extend(names.iter().map(|name| Path::new(directory).join(name)));
+    }
+    candidates
+}
+
+fn find_executable(names: &[&str]) -> Option<PathBuf> {
+    executable_candidates(names)
+        .into_iter()
+        .find_map(|candidate| {
+            let metadata = fs::metadata(&candidate).ok()?;
+            metadata
+                .is_file()
+                .then(|| candidate.canonicalize().unwrap_or(candidate))
+        })
+}
+
+fn install_dependency(kind: AgentConnectorKind) -> Result<bool, String> {
+    let needs_node = matches!(kind, AgentConnectorKind::Codex | AgentConnectorKind::Claude);
+    if needs_node && find_executable(&["npm.cmd", "npm.exe", "npm"]).is_some() {
+        return Ok(false);
+    }
+    if !needs_node && find_executable(&["python.exe", "python3.exe", "python3", "python"]).is_some()
+    {
+        return Ok(false);
+    }
+
+    #[cfg(windows)]
+    {
+        let winget = find_executable(&["winget.exe"]).ok_or_else(|| {
+            "缺少依赖且未找到 winget，请先安装 Node.js LTS 或 Python 3".to_string()
+        })?;
+        let package = if needs_node {
+            "OpenJS.NodeJS.LTS"
+        } else {
+            "Python.Python.3.12"
+        };
+        let arguments = [
+            "install",
+            "--id",
+            package,
+            "--exact",
+            "--silent",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        let result = run_bounded_process(
+            &winget,
+            &arguments,
+            None,
+            AGENT_INSTALL_TIMEOUT,
+            AGENT_INSTALL_OUTPUT_MAX_BYTES,
+        )
+        .map_err(|error| error.message)?;
+        if !result.success {
+            return Err(format!(
+                "依赖安装失败：{}",
+                if result.stderr.is_empty() {
+                    result.stdout
+                } else {
+                    result.stderr
+                }
+            ));
+        }
+        return Ok(true);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let brew = find_executable(&["brew"]).ok_or_else(|| {
+            if needs_node {
+                "缺少 Node.js，请先安装 Homebrew 或 Node.js LTS"
+            } else {
+                "缺少 Python 3，请先安装 Homebrew 或 Python 3"
+            }
+            .to_string()
+        })?;
+        let package = if needs_node { "node" } else { "python" };
+        let arguments = ["install", package]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        let result = run_bounded_process(
+            &brew,
+            &arguments,
+            None,
+            AGENT_INSTALL_TIMEOUT,
+            AGENT_INSTALL_OUTPUT_MAX_BYTES,
+        )
+        .map_err(|error| error.message)?;
+        if !result.success {
+            return Err(format!(
+                "依赖安装失败：{}",
+                if result.stderr.is_empty() {
+                    result.stdout
+                } else {
+                    result.stderr
+                }
+            ));
+        }
+        return Ok(true);
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    Err("当前系统暂不支持自动安装依赖".to_string())
+}
+
+fn managed_agent_bin_directory() -> Result<PathBuf, String> {
+    let home = agent_user_home().ok_or_else(|| "无法定位用户目录".to_string())?;
+    let directory = home.join(".wormhole-pie").join("agents").join("bin");
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建 Agent 启动目录：{error}"))?;
+    Ok(directory)
+}
+
+fn write_agent_launcher(kind: AgentConnectorKind, executable: &Path) -> Result<PathBuf, String> {
+    let bin = managed_agent_bin_directory()?;
+    #[cfg(windows)]
+    {
+        let launcher = bin.join(format!("{}.cmd", kind.command_name()));
+        let content = format!("@echo off\r\ncall \"{}\" %*\r\n", executable.display());
+        fs::write(&launcher, content).map_err(|error| format!("无法创建 Agent 启动器：{error}"))?;
+        Ok(launcher)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = bin.join(kind.command_name());
+        let escaped = executable.to_string_lossy().replace('"', "\\\"");
+        fs::write(&launcher, format!("#!/bin/sh\nexec \"{escaped}\" \"$@\"\n"))
+            .map_err(|error| format!("无法创建 Agent 启动器：{error}"))?;
+        let mut permissions = fs::metadata(&launcher)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&launcher, permissions).map_err(|error| error.to_string())?;
+        Ok(launcher)
+    }
+}
+
+fn npm_agent_package(kind: AgentConnectorKind) -> Option<&'static str> {
+    match kind {
+        AgentConnectorKind::Codex => Some("@openai/codex@latest"),
+        AgentConnectorKind::Claude => Some("@anthropic-ai/claude-code@latest"),
+        AgentConnectorKind::Hermes => None,
+    }
+}
+
+fn install_agent_blocking(request: AgentInstallRequest) -> Result<AgentInstallResult, String> {
+    let kind = AgentConnectorKind::from_id(request.connector_id.trim())
+        .ok_or_else(|| "仅支持 codex、claude 或 hermes".to_string())?;
+    let install_root = validate_agent_install_directory(&request.install_directory)?;
+    let dependency_installed = install_dependency(kind)?;
+    let use_china_mirror = request.locale.eq_ignore_ascii_case("zh-CN");
+    let target = install_root.join(kind.id());
+    fs::create_dir_all(&target).map_err(|error| format!("无法创建 Agent 安装目录：{error}"))?;
+
+    let executable = if let Some(package) = npm_agent_package(kind) {
+        let npm = find_executable(&["npm.cmd", "npm.exe", "npm"]).ok_or_else(|| {
+            "Node.js 已安装，但当前进程仍找不到 npm；请重启虫洞派后再试".to_string()
+        })?;
+        let registry = if use_china_mirror {
+            "https://registry.npmmirror.com"
+        } else {
+            "https://registry.npmjs.org"
+        };
+        let arguments = [
+            "install".into(),
+            "--prefix".into(),
+            target.as_os_str().to_owned(),
+            package.into(),
+            "--no-audit".into(),
+            "--no-fund".into(),
+            "--registry".into(),
+            registry.into(),
+        ];
+        let result = run_bounded_process(
+            &npm,
+            &arguments,
+            None,
+            AGENT_INSTALL_TIMEOUT,
+            AGENT_INSTALL_OUTPUT_MAX_BYTES,
+        )
+        .map_err(|error| error.message)?;
+        if !result.success {
+            return Err(format!(
+                "{} 安装失败：{}",
+                kind.name(),
+                if result.stderr.is_empty() {
+                    result.stdout
+                } else {
+                    result.stderr
+                }
+            ));
+        }
+        #[cfg(windows)]
+        let candidate = target
+            .join("node_modules")
+            .join(".bin")
+            .join(format!("{}.cmd", kind.command_name()));
+        #[cfg(not(windows))]
+        let candidate = target
+            .join("node_modules")
+            .join(".bin")
+            .join(kind.command_name());
+        candidate
+    } else {
+        let python = find_executable(&["python.exe", "python3.exe", "python3", "python"])
+            .ok_or_else(|| {
+                "Python 3 已安装，但当前进程仍找不到它；请重启虫洞派后再试".to_string()
+            })?;
+        let venv = target.join("venv");
+        let create_arguments = ["-m".into(), "venv".into(), venv.as_os_str().to_owned()];
+        let created = run_bounded_process(
+            &python,
+            &create_arguments,
+            None,
+            AGENT_INSTALL_TIMEOUT,
+            AGENT_INSTALL_OUTPUT_MAX_BYTES,
+        )
+        .map_err(|error| error.message)?;
+        if !created.success {
+            return Err(format!(
+                "Hermes Python 环境创建失败：{}",
+                if created.stderr.is_empty() {
+                    created.stdout
+                } else {
+                    created.stderr
+                }
+            ));
+        }
+        #[cfg(windows)]
+        let venv_python = venv.join("Scripts").join("python.exe");
+        #[cfg(not(windows))]
+        let venv_python = venv.join("bin").join("python");
+        let index = if use_china_mirror {
+            "https://pypi.tuna.tsinghua.edu.cn/simple"
+        } else {
+            "https://pypi.org/simple"
+        };
+        let pip_arguments = [
+            "-m".into(),
+            "pip".into(),
+            "install".into(),
+            "--upgrade".into(),
+            "hermes-agent".into(),
+            "--index-url".into(),
+            index.into(),
+        ];
+        let installed = run_bounded_process(
+            &venv_python,
+            &pip_arguments,
+            None,
+            AGENT_INSTALL_TIMEOUT,
+            AGENT_INSTALL_OUTPUT_MAX_BYTES,
+        )
+        .map_err(|error| error.message)?;
+        if !installed.success {
+            return Err(format!(
+                "Hermes Agent 安装失败：{}",
+                if installed.stderr.is_empty() {
+                    installed.stdout
+                } else {
+                    installed.stderr
+                }
+            ));
+        }
+        #[cfg(windows)]
+        let candidate = venv.join("Scripts").join("hermes.exe");
+        #[cfg(not(windows))]
+        let candidate = venv.join("bin").join("hermes");
+        candidate
+    };
+
+    if !executable.is_file() {
+        return Err(format!("安装已结束，但没有找到 {} 启动文件", kind.name()));
+    }
+    let launcher = write_agent_launcher(kind, &executable)?;
+    invalidate_agent_connector_cache(kind);
+    Ok(AgentInstallResult {
+        connector_id: kind.id().to_string(),
+        success: true,
+        dependency_installed,
+        executable: Some(launcher.to_string_lossy().to_string()),
+        detail: format!(
+            "{} 已安装到 {}，使用{}",
+            kind.name(),
+            target.display(),
+            if use_china_mirror {
+                "中国镜像源"
+            } else {
+                "国际官方源"
+            }
+        ),
+    })
+}
+
+#[tauri::command]
+async fn install_agent(request: AgentInstallRequest) -> Result<AgentInstallResult, String> {
+    tauri::async_runtime::spawn_blocking(move || install_agent_blocking(request))
+        .await
+        .map_err(|error| format!("Agent 安装任务异常：{error}"))?
+}
+
+fn validate_agent_api_config(
+    config: &AgentApiConfig,
+) -> Result<(AgentConnectorKind, url::Url), String> {
+    let kind = AgentConnectorKind::from_id(config.connector_id.trim())
+        .ok_or_else(|| "不支持的 Agent 类型".to_string())?;
+    let url =
+        url::Url::parse(config.base_url.trim()).map_err(|_| "接口地址格式无效".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err("接口地址必须是有效的 http 或 https 地址".to_string());
+    }
+    if config.model.len() > 200 || config.api_key.len() > 8_192 {
+        return Err("API 配置内容过长".to_string());
+    }
+    if config
+        .api_key
+        .chars()
+        .chain(config.model.chars())
+        .any(|character| matches!(character, '\0' | '\r' | '\n'))
+    {
+        return Err("API 配置不能包含换行或控制字符".to_string());
+    }
+    Ok((kind, url))
+}
+
+#[tauri::command]
+async fn test_agent_api(config: AgentApiConfig) -> Result<AgentApiTestResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_, url) = validate_agent_api_config(&config)?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| "接口地址缺少主机".to_string())?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| "接口地址端口无效".to_string())?;
+        let addresses = (host, port)
+            .to_socket_addrs()
+            .map_err(|error| format!("无法解析接口地址：{error}"))?;
+        for address in addresses {
+            if TcpStream::connect_timeout(&address, Duration::from_secs(5)).is_ok() {
+                return Ok(AgentApiTestResult {
+                    reachable: true,
+                    detail: format!("连接成功：{host}:{port}"),
+                });
+            }
+        }
+        Ok(AgentApiTestResult {
+            reachable: false,
+            detail: format!("无法连接：{host}:{port}"),
+        })
+    })
+    .await
+    .map_err(|error| format!("接口测试任务异常：{error}"))?
+}
+
+fn json_object(path: &Path) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    if !path.exists() {
+        return Ok(serde_json::Map::new());
+    }
+    let content = fs::read_to_string(path).map_err(|error| format!("无法读取配置：{error}"))?;
+    serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|error| format!("现有配置不是有效 JSON：{error}"))?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "现有配置必须是 JSON 对象".to_string())
+}
+
+fn write_pretty_json(
+    path: &Path,
+    object: serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("无法创建配置目录：{error}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(&serde_json::Value::Object(object))
+        .map_err(|error| error.to_string())?;
+    fs::write(path, bytes).map_err(|error| format!("无法写入配置：{error}"))
+}
+
+fn toml_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\r', '\n'], " ")
+}
+
+fn replace_managed_codex_block(existing: &str, block: &str) -> String {
+    const START: &str = "# BEGIN WORMHOLE PIE MANAGED CONFIG";
+    const END: &str = "# END WORMHOLE PIE MANAGED CONFIG";
+    if let Some(start) = existing.find(START) {
+        if let Some(relative_end) = existing[start..].find(END) {
+            let end = start + relative_end + END.len();
+            let mut rest = existing.to_string();
+            rest.replace_range(start..end, "");
+            return format!("{block}\n{}", rest.trim_start());
+        }
+    }
+    format!("{block}\n{existing}")
+}
+
+fn update_env_file(path: &Path, updates: &[(&str, String)]) -> Result<(), String> {
+    let existing = fs::read_to_string(path).unwrap_or_default();
+    let active_updates = updates
+        .iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect::<Vec<_>>();
+    let keys = active_updates
+        .iter()
+        .map(|(key, _)| *key)
+        .collect::<HashSet<_>>();
+    let mut lines = existing
+        .lines()
+        .filter(|line| {
+            line.split_once('=')
+                .is_none_or(|(key, _)| !keys.contains(key.trim()))
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    lines.extend(
+        active_updates
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}")),
+    );
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    fs::write(path, format!("{}\n", lines.join("\n")))
+        .map_err(|error| format!("无法写入配置：{error}"))
+}
+
+fn save_agent_api_config_blocking(config: AgentApiConfig) -> Result<(), String> {
+    let (kind, _) = validate_agent_api_config(&config)?;
+    let home = agent_user_home().ok_or_else(|| "无法定位用户目录".to_string())?;
+    match kind {
+        AgentConnectorKind::Codex => {
+            let root = home.join(".codex");
+            fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+            let config_path = root.join("config.toml");
+            let existing = fs::read_to_string(&config_path).unwrap_or_default();
+            let block = format!(
+                "# BEGIN WORMHOLE PIE MANAGED CONFIG\nmodel = \"{}\"\nmodel_provider = \"wormhole-pie\"\n\n[model_providers.\"wormhole-pie\"]\nname = \"Wormhole Pie\"\nbase_url = \"{}\"\nenv_key = \"OPENAI_API_KEY\"\nwire_api = \"responses\"\n# END WORMHOLE PIE MANAGED CONFIG",
+                toml_string(&config.model), toml_string(&config.base_url)
+            );
+            fs::write(&config_path, replace_managed_codex_block(&existing, &block))
+                .map_err(|error| format!("无法写入 Codex 配置：{error}"))?;
+            if !config.api_key.is_empty() {
+                let auth_path = root.join("auth.json");
+                let mut auth = json_object(&auth_path)?;
+                auth.insert("OPENAI_API_KEY".to_string(), config.api_key.into());
+                write_pretty_json(&auth_path, auth)?;
+            }
+        }
+        AgentConnectorKind::Claude => {
+            let path = home.join(".claude").join("settings.json");
+            let mut settings = json_object(&path)?;
+            let env = settings
+                .entry("env".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let env = env
+                .as_object_mut()
+                .ok_or_else(|| "Claude settings.json 中的 env 必须是对象".to_string())?;
+            if !config.api_key.is_empty() {
+                env.insert("ANTHROPIC_API_KEY".to_string(), config.api_key.into());
+            }
+            env.insert("ANTHROPIC_BASE_URL".to_string(), config.base_url.into());
+            if !config.model.is_empty() {
+                env.insert("ANTHROPIC_MODEL".to_string(), config.model.into());
+            }
+            write_pretty_json(&path, settings)?;
+        }
+        AgentConnectorKind::Hermes => {
+            update_env_file(
+                &home.join(".hermes").join(".env"),
+                &[
+                    ("OPENAI_API_KEY", config.api_key),
+                    ("OPENAI_BASE_URL", config.base_url),
+                    ("LLM_MODEL", config.model),
+                ],
+            )?;
+        }
+    }
+    invalidate_agent_connector_cache(kind);
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_agent_api_config(config: AgentApiConfig) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_agent_api_config_blocking(config))
+        .await
+        .map_err(|error| format!("保存 API 配置任务异常：{error}"))?
+}
+
+#[tauri::command]
 fn pick_dialogue_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let files = app
         .dialog()
@@ -5755,12 +6559,18 @@ pub fn run() {
             list_organize_exclusions,
             remove_organize_exclusion,
             undo_desktop_organize,
+            restore_library_items_to_desktop,
             update_file_category,
             open_file,
             list_programs,
             launch_program,
             list_agent_connectors,
             get_agent_default_workspace,
+            get_agent_default_install_directory,
+            pick_directory,
+            install_agent,
+            test_agent_api,
+            save_agent_api_config,
             pick_dialogue_files,
             get_agent_task_status,
             get_agent_task_result,
@@ -6212,6 +7022,54 @@ mod tests {
         assert!(validate_agent_workspace(&file.to_string_lossy()).is_err());
         assert!(validate_agent_workspace("relative/workspace").is_err());
         assert!(validate_agent_workspace(&workspace.0.join("missing").to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn agent_install_and_api_inputs_are_bounded_and_platform_safe() {
+        let workspace = TempWorkspace::new("agent-install-root");
+        let install = validate_agent_install_directory(&workspace.0.to_string_lossy()).unwrap();
+        assert_eq!(install, workspace.0.canonicalize().unwrap());
+        assert!(validate_agent_install_directory("relative/agents").is_err());
+        assert!(validate_agent_install_directory(
+            install
+                .ancestors()
+                .last()
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        )
+        .is_err());
+
+        let valid = AgentApiConfig {
+            connector_id: "codex".to_string(),
+            api_key: "secret-not-logged".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-test".to_string(),
+        };
+        assert!(validate_agent_api_config(&valid).is_ok());
+        assert!(validate_agent_api_config(&AgentApiConfig {
+            base_url: "file:///tmp/key".to_string(),
+            ..valid.clone()
+        })
+        .is_err());
+        assert!(validate_agent_api_config(&AgentApiConfig {
+            connector_id: "unknown".to_string(),
+            ..valid
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn codex_managed_config_replacement_is_idempotent() {
+        let first = "# BEGIN WORMHOLE PIE MANAGED CONFIG\nmodel = \"old\"\n# END WORMHOLE PIE MANAGED CONFIG";
+        let replacement = "# BEGIN WORMHOLE PIE MANAGED CONFIG\nmodel = \"new\"\n# END WORMHOLE PIE MANAGED CONFIG";
+        let updated = replace_managed_codex_block(
+            &format!("{first}\n[history]\npersistence = \"save-all\"\n"),
+            replacement,
+        );
+        assert_eq!(updated.matches("BEGIN WORMHOLE PIE").count(), 1);
+        assert!(updated.contains("model = \"new\""));
+        assert!(updated.contains("[history]"));
     }
 
     #[test]
