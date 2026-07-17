@@ -68,6 +68,38 @@ export type AgentTaskStatus = {
   detail: string;
 };
 
+export type AgentInstallRequest = {
+  connectorId: AgentConnectorId;
+  locale: "zh-CN" | "en-US";
+  installDirectory: string;
+};
+
+export type AgentInstallResult = {
+  connectorId: AgentConnectorId;
+  success: boolean;
+  dependencyInstalled: boolean;
+  executable?: string;
+  detail: string;
+};
+
+export type AgentApiConfig = {
+  connectorId: AgentConnectorId;
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+};
+
+export type AgentApiTestResult = {
+  reachable: boolean;
+  detail: string;
+};
+
+export type LibraryRestoreResult = {
+  restoredCount: number;
+  conflictCount: number;
+  restoredPaths: string[];
+};
+
 const browserAgentConnectors: AgentConnectorStatus[] = [
   { id: "codex", name: "Codex", detected: false, available: false, configured: false, configurationState: "not_installed", detail: "浏览器预览无法检测本机 CLI 与配置" },
   { id: "claude", name: "Claude Code", detected: false, available: false, configured: false, configurationState: "not_installed", detail: "浏览器预览无法检测本机 CLI 与配置" },
@@ -410,6 +442,73 @@ export async function getAgentDefaultWorkspace(): Promise<string> {
   if (!isTauri()) return "C:\\Users\\你\\Documents";
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string>("get_agent_default_workspace");
+}
+
+export async function getAgentDefaultInstallDirectory(): Promise<string> {
+  if (!isTauri()) return "C:\\Users\\你\\Documents\\虫洞派 Agents";
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("get_agent_default_install_directory");
+}
+
+export async function pickDirectory(title: string): Promise<string | null> {
+  if (!isTauri()) return title.includes("任务") ? "C:\\Users\\你\\Documents\\Codex" : "C:\\Users\\你\\Documents\\虫洞派 Agents";
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string | null>("pick_directory", { title });
+}
+
+export async function installAgent(request: AgentInstallRequest): Promise<AgentInstallResult> {
+  if (!isTauri()) {
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 700));
+    return {
+      connectorId: request.connectorId,
+      success: true,
+      dependencyInstalled: false,
+      executable: `${request.installDirectory}\\${request.connectorId}`,
+      detail: request.locale === "zh-CN" ? "浏览器预览：已模拟使用中国镜像源安装" : "Browser preview: simulated global-source installation",
+    };
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<AgentInstallResult>("install_agent", { request });
+}
+
+export async function testAgentApi(config: AgentApiConfig): Promise<AgentApiTestResult> {
+  if (!isTauri()) return { reachable: true, detail: "浏览器预览：接口地址可达" };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<AgentApiTestResult>("test_agent_api", { config });
+}
+
+export async function saveAgentApiConfig(config: AgentApiConfig): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("save_agent_api_config", { config });
+}
+
+export async function showMainFromTray(): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("show_main_from_tray");
+}
+
+export async function restoreLibraryItemsToDesktop(paths: string[]): Promise<LibraryRestoreResult> {
+  if (!paths.length) return { restoredCount: 0, conflictCount: 0, restoredPaths: [] };
+  if (!isTauri()) {
+    const normalize = (path: string) => path.replace(/\//g, "\\").toLowerCase();
+    const selected = new Set(paths.map(normalize));
+    const selectedNames = new Set(paths.map((path) => normalize(path).split("\\").pop() ?? ""));
+    const isSelected = (file: DesktopFile) => selected.has(normalize(file.path)) || selectedNames.has(file.name.toLowerCase());
+    const restoring = browserOrganizedFiles.filter(isSelected);
+    browserOrganizedFiles = browserOrganizedFiles.filter((file) => !isSelected(file));
+    const restored = restoring.map((file) => ({
+      ...file,
+      path: joinWindowsPath("C:\\Users\\你\\Desktop", file.name),
+      organizedCategory: undefined,
+      isNew: false,
+    }));
+    browserDesktopFiles = [...browserDesktopFiles, ...restored];
+    return { restoredCount: restored.length, conflictCount: 0, restoredPaths: restored.map((file) => file.path) };
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<LibraryRestoreResult>("restore_library_items_to_desktop", { paths });
 }
 
 export async function runAgentTask(
