@@ -7,7 +7,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   windows:
@@ -93,3 +93,28 @@ jobs:
           name: wormhole-pie-macos-universal
           if-no-files-found: error
           path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wormhole-pie-windows
+          path: release-assets/windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: wormhole-pie-macos-universal
+          path: release-assets/macos
+      - name: Publish installers
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Wormhole Pie ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/windows/**/*.exe
+            release-assets/windows/**/*.msi
+            release-assets/macos/**/*.dmg
