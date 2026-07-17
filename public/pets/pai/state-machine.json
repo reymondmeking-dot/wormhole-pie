@@ -1,0 +1,158 @@
+{
+  "version": 2,
+  "default": "idle_breathe",
+  "signals": {
+    "single_click": ["click_feedback"],
+    "double_click": ["double_click_excited"],
+    "pointer_enter": ["cursor_notice"],
+    "pointer_hover": ["hover_interest"],
+    "pointer_pet_hold": ["pet_loop"],
+    "pointer_tickle": ["tickle_laugh"],
+    "high_five_gesture": ["high_five"],
+    "pointer_drag": ["drag"],
+    "pointer_release_slow": ["release_bounce"],
+    "pointer_release_fast": ["release_bounce"],
+    "typing_started": ["typing_watch"],
+    "voice_wake": ["voice_wake", "listen"],
+    "voice_started": ["listen"],
+    "voice_cancelled": ["emotion_sad"],
+    "request_submitted": ["think"],
+    "permission_required": ["permission_wait"],
+    "speech_started": ["speak_loop"],
+    "task_completed": ["task_success", "emotion_happy"],
+    "task_failed": ["task_failure"],
+    "file_entered": ["file_notice"],
+    "confirmed_file_drop": ["file_eat"],
+    "file_rejected": ["file_reject"],
+    "recycle_completed": ["trash_success"],
+    "recycle_failed": ["trash_fail_cough"],
+    "rest_threshold_reached": ["rest_reminder"],
+    "user_affection": ["affection", "emotion_happy"],
+    "hide_requested": ["hide_peek"],
+    "idle_timeout": ["yawn", "sleep"],
+    "move_to_target": ["walk"],
+    "move_to_target_fast": ["run"],
+    "screen_edge_reached": ["edge_balance"],
+    "small_obstacle": ["hop"],
+    "pleasant_event": ["emotion_happy"],
+    "unexpected_event": ["emotion_surprised"],
+    "repeated_poking": ["emotion_angry"],
+    "long_ignored": ["emotion_sad"]
+  },
+  "globalRules": [
+    "Higher-priority actions may interrupt lower-priority actions only according to the currently playing action's interrupt rule.",
+    "One-shot actions return to the previous viable loop after onAnimationEnd; timer-based forced resets are forbidden.",
+    "An autonomous action may never interrupt an action with priority above 30.",
+    "Do not repeat the same autonomous action until at least two different autonomous actions have played.",
+    "file_eat may move a file to the system recycle bin only at marker commitToRecycleBin and only after explicit confirmation.",
+    "Cancelling, interrupting or failing file_eat before commitToRecycleBin must leave the file unchanged.",
+    "bottom-layer click-through disables click_feedback, double_click_excited, pet_loop, tickle_laugh, drag, affection, high_five and all file actions.",
+    "Fullscreen, meeting, presentation, recording and do-not-disturb states suppress rest_reminder and all autonomous attention actions.",
+    "Dragging, voice capture, permission prompts and file operations pause autonomous scheduling.",
+    "Reduced-motion mode still completes one-shot actions and their markers, but may hold representative frames instead of looping.",
+    "Cursor eye tracking and head tracking are additive procedural layers and must not replace the body action state.",
+    "Random selection must be weighted by needs, recent interaction memory, time of day and per-character personality modifiers."
+  ],
+  "autonomy": {
+    "enabled": true,
+    "schedulerTickMs": 1000,
+    "decisionIntervalMs": [45000, 90000],
+    "noRepeatWindow": 3,
+    "maxAutonomousPriority": 30,
+    "minimumIdleBeforeAutonomyMs": 10000,
+    "pools": [
+      {
+        "id": "micro",
+        "when": { "idleForMs": [10000, 60000] },
+        "actions": {
+          "blink": 42,
+          "ear_twitch": 24,
+          "tail_flick": 22,
+          "idle_lookaround": 12
+        }
+      },
+      {
+        "id": "settled",
+        "when": { "idleForMs": [60000, 240000] },
+        "actions": {
+          "idle_lookaround": 28,
+          "stretch": 18,
+          "groom": 12,
+          "blink": 12,
+          "tail_flick": 18,
+          "yawn": 6
+        }
+      },
+      {
+        "id": "long_idle",
+        "when": { "idleForMs": [240000, 1200000] },
+        "actions": {
+          "stretch": 22,
+          "groom": 20,
+          "yawn": 18,
+          "snack_eat": 10,
+          "dance": 6,
+          "emotion_sad": 4,
+          "idle_lookaround": 20
+        }
+      }
+    ],
+    "circadian": {
+      "morning": { "hours": [6, 10], "energyDeltaPerHour": 6, "sleepinessDeltaPerHour": -8 },
+      "day": { "hours": [10, 19], "energyDeltaPerHour": -2, "sleepinessDeltaPerHour": 2 },
+      "evening": { "hours": [19, 23], "energyDeltaPerHour": -5, "sleepinessDeltaPerHour": 8 },
+      "night": { "hours": [23, 6], "energyDeltaPerHour": -8, "sleepinessDeltaPerHour": 12, "prefer": ["yawn", "sleep"] }
+    },
+    "memory": {
+      "recentEvents": 16,
+      "affectionBoostMs": 900000,
+      "roughDragPenaltyMs": 300000,
+      "failureMoodPenaltyMs": 180000,
+      "successMoodBoostMs": 300000
+    }
+  },
+  "needs": {
+    "energy": {
+      "min": 0,
+      "max": 100,
+      "initial": 72,
+      "sleepBelow": 18,
+      "drainPerActiveHour": 7,
+      "recoverPerSleepHour": 28
+    },
+    "sleepiness": {
+      "min": 0,
+      "max": 100,
+      "initial": 24,
+      "sleepAbove": 82,
+      "gainPerAwakeHour": 6,
+      "recoverPerSleepHour": 34
+    },
+    "hunger": {
+      "min": 0,
+      "max": 100,
+      "initial": 25,
+      "gainPerHour": 5,
+      "snackThreshold": 65
+    },
+    "mood": {
+      "min": -100,
+      "max": 100,
+      "initial": 35,
+      "decayTowardZeroPerHour": 4
+    },
+    "bond": {
+      "min": 0,
+      "max": 100,
+      "initial": 20,
+      "dailyDecay": 1
+    },
+    "boredom": {
+      "min": 0,
+      "max": 100,
+      "initial": 12,
+      "gainPerIdleHour": 18,
+      "interactionReduction": 12
+    }
+  }
+}

@@ -1,0 +1,457 @@
+{
+  "version": 2,
+  "framePattern": "../frames/{size}/{pet}/{action}/{frame}.png",
+  "defaults": {
+    "frames": 4,
+    "anchor": "feet_center",
+    "lockFrame1": true,
+    "blendInMs": 80,
+    "blendOutMs": 120,
+    "sequence": [1, 2, 3, 4]
+  },
+  "actions": {
+    "idle_breathe": {
+      "group": "life",
+      "priority": 10,
+      "mode": "loop",
+      "sequence": [1, 2, 3, 4, 3, 2],
+      "fps": 6,
+      "interrupt": "immediate",
+      "cooldownMs": 0,
+      "autonomous": true,
+      "weight": 100
+    },
+    "walk": {
+      "group": "life",
+      "priority": 62,
+      "mode": "loop",
+      "sequence": [2, 3, 4, 3],
+      "entrySequence": [1, 2],
+      "fps": 10,
+      "interrupt": "immediate",
+      "directional": true,
+      "mirrorSafe": false
+    },
+    "sleep": {
+      "group": "life",
+      "priority": 35,
+      "mode": "hold_last_ping_pong",
+      "sequence": [1, 2, 3, 4, 3, 2],
+      "fps": 5,
+      "interrupt": "loop_boundary",
+      "holdLastMs": 1800
+    },
+    "click_feedback": {
+      "group": "life",
+      "priority": 88,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 220
+    },
+    "listen": {
+      "group": "agent",
+      "priority": 87,
+      "mode": "ping_pong",
+      "sequence": [1, 2, 3, 4, 3, 2],
+      "fps": 9,
+      "interrupt": "immediate",
+      "markers": { "vadReady": 2 }
+    },
+    "think": {
+      "group": "agent",
+      "priority": 84,
+      "mode": "ping_pong",
+      "sequence": [1, 2, 3, 4, 3, 2],
+      "fps": 7,
+      "interrupt": "immediate",
+      "longWaitFallback": "permission_wait"
+    },
+    "task_success": {
+      "group": "agent",
+      "priority": 88,
+      "mode": "once",
+      "fps": 12,
+      "interrupt": "loop_boundary",
+      "markers": { "sfx": 2, "showResult": 4 }
+    },
+    "file_eat": {
+      "group": "agent",
+      "priority": 100,
+      "mode": "once",
+      "fps": 12,
+      "interrupt": "key_marker",
+      "markers": { "bite": 2, "commitToRecycleBin": 3, "finish": 4 },
+      "requiresConfirmation": true
+    },
+    "drag": {
+      "group": "social",
+      "priority": 95,
+      "mode": "velocity_driven",
+      "sequence": [2, 3, 4, 3],
+      "fps": 12,
+      "interrupt": "immediate",
+      "markers": { "held": 2, "sway": 3, "release": 4 }
+    },
+    "rest_reminder": {
+      "group": "social",
+      "priority": 58,
+      "mode": "hold_last",
+      "fps": 8,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 1200000
+    },
+    "affection": {
+      "group": "social",
+      "priority": 75,
+      "mode": "once",
+      "fps": 10,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 600
+    },
+    "hide_peek": {
+      "group": "social",
+      "priority": 68,
+      "mode": "ping_pong",
+      "sequence": [1, 2, 3, 4, 3, 2],
+      "fps": 7,
+      "interrupt": "immediate"
+    },
+
+    "blink": {
+      "group": "micro_life",
+      "priority": 15,
+      "mode": "once",
+      "fps": 16,
+      "interrupt": "immediate",
+      "randomCooldownMs": [15000, 45000],
+      "autonomous": true,
+      "weight": 42
+    },
+    "ear_twitch": {
+      "group": "micro_life",
+      "priority": 15,
+      "mode": "once",
+      "fps": 12,
+      "interrupt": "immediate",
+      "randomCooldownMs": [30000, 90000],
+      "autonomous": true,
+      "weight": 24
+    },
+    "tail_flick": {
+      "group": "micro_life",
+      "priority": 15,
+      "mode": "once",
+      "fps": 10,
+      "interrupt": "immediate",
+      "randomCooldownMs": [25000, 75000],
+      "autonomous": true,
+      "weight": 22
+    },
+    "yawn": {
+      "group": "micro_life",
+      "priority": 30,
+      "mode": "once",
+      "fps": 9,
+      "interrupt": "loop_boundary",
+      "randomCooldownMs": [300000, 900000],
+      "autonomous": true,
+      "weight": 8,
+      "needBias": { "sleepiness": 0.8, "energy": -0.5 }
+    },
+
+    "idle_lookaround": {
+      "group": "curiosity",
+      "priority": 15,
+      "mode": "once",
+      "fps": 8,
+      "interrupt": "immediate",
+      "randomCooldownMs": [45000, 150000],
+      "autonomous": true,
+      "weight": 28
+    },
+    "cursor_notice": {
+      "group": "curiosity",
+      "priority": 55,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "immediate",
+      "cooldownMs": 2500
+    },
+    "hover_interest": {
+      "group": "curiosity",
+      "priority": 60,
+      "mode": "ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 9,
+      "interrupt": "immediate",
+      "cooldownMs": 400
+    },
+    "typing_watch": {
+      "group": "curiosity",
+      "priority": 30,
+      "mode": "ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 7,
+      "interrupt": "immediate",
+      "cooldownMs": 5000
+    },
+
+    "run": {
+      "group": "motion",
+      "priority": 68,
+      "mode": "loop",
+      "sequence": [2, 3, 4, 3],
+      "entrySequence": [1, 2],
+      "fps": 16,
+      "interrupt": "immediate",
+      "directional": true,
+      "mirrorSafe": false
+    },
+    "hop": {
+      "group": "motion",
+      "priority": 60,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "key_marker",
+      "markers": { "takeoff": 2, "apex": 3, "land": 4 },
+      "cooldownMs": 1800
+    },
+    "edge_balance": {
+      "group": "motion",
+      "priority": 72,
+      "mode": "ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 12,
+      "interrupt": "immediate"
+    },
+    "release_bounce": {
+      "group": "motion",
+      "priority": 94,
+      "mode": "once",
+      "fps": 16,
+      "interrupt": "key_marker",
+      "markers": { "land": 2, "rebound": 3, "settle": 4 }
+    },
+
+    "double_click_excited": {
+      "group": "touch",
+      "priority": 90,
+      "mode": "once",
+      "fps": 16,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 350
+    },
+    "pet_loop": {
+      "group": "touch",
+      "priority": 88,
+      "mode": "ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 12,
+      "interrupt": "immediate",
+      "requiresPointerHold": true
+    },
+    "tickle_laugh": {
+      "group": "touch",
+      "priority": 88,
+      "mode": "once",
+      "fps": 16,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 750
+    },
+    "high_five": {
+      "group": "touch",
+      "priority": 80,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "key_marker",
+      "markers": { "pawReady": 2, "contact": 3, "finish": 4 },
+      "cooldownMs": 1000
+    },
+
+    "emotion_happy": {
+      "group": "emotion",
+      "priority": 45,
+      "mode": "once",
+      "fps": 12,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 4000,
+      "needEffect": { "mood": 8, "bond": 1 }
+    },
+    "emotion_surprised": {
+      "group": "emotion",
+      "priority": 48,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "immediate",
+      "cooldownMs": 3500
+    },
+    "emotion_sad": {
+      "group": "emotion",
+      "priority": 42,
+      "mode": "hold_last_ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 7,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 30000,
+      "needBias": { "mood": -0.8, "boredom": 0.4 }
+    },
+    "emotion_angry": {
+      "group": "emotion",
+      "priority": 48,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 12000
+    },
+
+    "stretch": {
+      "group": "daily",
+      "priority": 30,
+      "mode": "once",
+      "fps": 10,
+      "interrupt": "loop_boundary",
+      "randomCooldownMs": [480000, 1200000],
+      "autonomous": true,
+      "weight": 18
+    },
+    "groom": {
+      "group": "daily",
+      "priority": 20,
+      "mode": "once",
+      "fps": 9,
+      "interrupt": "loop_boundary",
+      "randomCooldownMs": [600000, 1800000],
+      "autonomous": true,
+      "weight": 12
+    },
+    "snack_eat": {
+      "group": "daily",
+      "priority": 30,
+      "mode": "once",
+      "fps": 10,
+      "interrupt": "loop_boundary",
+      "randomCooldownMs": [1200000, 3600000],
+      "autonomous": true,
+      "weight": 6,
+      "needBias": { "hunger": 0.9 },
+      "needEffect": { "hunger": -30, "mood": 3 }
+    },
+    "dance": {
+      "group": "daily",
+      "priority": 30,
+      "mode": "ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 14,
+      "interrupt": "loop_boundary",
+      "randomCooldownMs": [1800000, 5400000],
+      "autonomous": true,
+      "weight": 5,
+      "needBias": { "mood": 0.7, "energy": 0.4 }
+    },
+
+    "voice_wake": {
+      "group": "agent_extended",
+      "priority": 88,
+      "mode": "once",
+      "fps": 15,
+      "interrupt": "immediate",
+      "cooldownMs": 500,
+      "markers": { "ready": 3 }
+    },
+    "task_failure": {
+      "group": "agent_extended",
+      "priority": 90,
+      "mode": "once",
+      "fps": 12,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 1000,
+      "markers": { "showError": 4 },
+      "needEffect": { "mood": -4 }
+    },
+    "permission_wait": {
+      "group": "agent_extended",
+      "priority": 95,
+      "mode": "hold_last_ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 8,
+      "interrupt": "immediate",
+      "cooldownMs": 0
+    },
+    "speak_loop": {
+      "group": "agent_extended",
+      "priority": 85,
+      "mode": "ping_pong",
+      "sequence": [2, 3, 4, 3],
+      "fps": 12,
+      "interrupt": "immediate",
+      "cooldownMs": 0
+    },
+
+    "file_notice": {
+      "group": "file_extended",
+      "priority": 78,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "immediate",
+      "cooldownMs": 500
+    },
+    "file_reject": {
+      "group": "file_extended",
+      "priority": 95,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 500,
+      "markers": { "showReason": 4 }
+    },
+    "trash_success": {
+      "group": "file_extended",
+      "priority": 82,
+      "mode": "once",
+      "fps": 14,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 500,
+      "markers": { "showResult": 4 }
+    },
+    "trash_fail_cough": {
+      "group": "file_extended",
+      "priority": 90,
+      "mode": "once",
+      "fps": 13,
+      "interrupt": "loop_boundary",
+      "cooldownMs": 500,
+      "markers": { "showError": 4 }
+    }
+  },
+  "proceduralLayers": {
+    "eye_track_cursor": {
+      "priority": 58,
+      "updateHz": 30,
+      "maxOffsetPercent": 5,
+      "disabledDuring": ["sleep", "drag", "file_eat", "run", "emotion_sad"]
+    },
+    "head_track_cursor": {
+      "priority": 52,
+      "updateHz": 20,
+      "maxRotateDeg": 7,
+      "maxTranslatePxAt256": 4,
+      "disabledDuring": ["sleep", "drag", "file_eat", "run"]
+    },
+    "secondary_motion": {
+      "updateHz": 60,
+      "targets": ["ears", "tail", "charm"],
+      "spring": 0.18,
+      "damping": 0.72
+    },
+    "blink_overlay": {
+      "randomIntervalMs": [4000, 12000],
+      "durationMs": 140,
+      "fallbackAction": "blink"
+    },
+    "shadow_layer": {
+      "separate": true,
+      "hideDuring": ["hop", "release_bounce", "drag", "hide_peek"]
+    }
+  }
+}

@@ -1,0 +1,126 @@
+{
+  "version": 2,
+  "frameSizes": [512, 256],
+  "anchor": "feet_center",
+  "baselineMargin512": 24,
+  "pets": [
+    {
+      "id": "nuonuo-corgi",
+      "name": "糯糯",
+      "species": "corgi",
+      "seed": "../seeds/transparent/nuonuo-corgi-transparent.png",
+      "accent": "#67c9ec",
+      "canonicalMax": 340,
+      "personality": "勇敢黏人的小伙伴",
+      "needModifiers": {
+        "energy": 1.15,
+        "sleepiness": 0.9,
+        "curiosity": 1.1,
+        "bond": 1.0
+      },
+      "actionWeightModifiers": {
+        "run": 1.35,
+        "high_five": 1.3,
+        "cursor_notice": 1.2,
+        "groom": 0.75
+      },
+      "processingOverrides": {
+        "agent": {
+          "keyColor": "#04f30d",
+          "frameReplacements": {
+            "file_eat/04.png": "task_success/04.png"
+          }
+        }
+      }
+    },
+    {
+      "id": "xingxing-cat",
+      "name": "星星",
+      "species": "cat",
+      "seed": "../seeds/transparent/xingxing-cat-transparent.png",
+      "accent": "#8067ff",
+      "canonicalMax": 360,
+      "personality": "安静、敏锐、喜欢观察",
+      "needModifiers": {
+        "energy": 0.9,
+        "sleepiness": 1.05,
+        "curiosity": 1.25,
+        "boredom": 0.8
+      },
+      "actionWeightModifiers": {
+        "idle_lookaround": 1.4,
+        "typing_watch": 1.35,
+        "groom": 1.35,
+        "dance": 0.7
+      }
+    },
+    {
+      "id": "taotao-bunny",
+      "name": "桃桃",
+      "species": "lop_bunny",
+      "seed": "../seeds/transparent/taotao-bunny-transparent.png",
+      "accent": "#ff8fae",
+      "canonicalMax": 360,
+      "personality": "温柔、亲人、会安慰人",
+      "needModifiers": {
+        "energy": 0.95,
+        "sleepiness": 1.1,
+        "curiosity": 1.0,
+        "bond": 1.2
+      },
+      "actionWeightModifiers": {
+        "pet_loop": 1.4,
+        "emotion_happy": 1.3,
+        "yawn": 1.2,
+        "emotion_angry": 0.65
+      },
+      "processingOverrides": {
+        "social": {
+          "keyColor": "#05f10c"
+        }
+      }
+    },
+    {
+      "id": "bobo-otter",
+      "name": "波波",
+      "species": "river_otter",
+      "seed": "../seeds/transparent/bobo-otter-transparent.png",
+      "accent": "#45b9e9",
+      "canonicalMax": 360,
+      "personality": "活泼、爱玩、喜欢帮忙",
+      "needModifiers": {
+        "energy": 1.2,
+        "sleepiness": 0.85,
+        "curiosity": 1.15,
+        "boredom": 1.15
+      },
+      "actionWeightModifiers": {
+        "hop": 1.4,
+        "dance": 1.35,
+        "file_notice": 1.25,
+        "snack_eat": 1.15
+      }
+    },
+    {
+      "id": "tangtang-bear",
+      "name": "糖糖",
+      "species": "bear_cub",
+      "seed": "../seeds/transparent/tangtang-bear-transparent.png",
+      "accent": "#e45f4e",
+      "canonicalMax": 360,
+      "personality": "稳重、耐心、有保护欲",
+      "needModifiers": {
+        "energy": 0.95,
+        "sleepiness": 1.0,
+        "curiosity": 0.9,
+        "bond": 1.15
+      },
+      "actionWeightModifiers": {
+        "permission_wait": 1.35,
+        "high_five": 1.25,
+        "snack_eat": 1.25,
+        "run": 0.8
+      }
+    }
+  ]
+}

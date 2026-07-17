@@ -1,0 +1,87 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Wormhole Pie",
+  "version": "0.1.0",
+  "identifier": "com.wormholepie.agent",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "虫洞派",
+        "width": 410,
+        "height": 660,
+        "minWidth": 340,
+        "minHeight": 520,
+        "maxWidth": 560,
+        "maxHeight": 760,
+        "resizable": true,
+        "fullscreen": false,
+        "transparent": true,
+        "decorations": false,
+        "shadow": false,
+        "center": false,
+        "skipTaskbar": true
+      },
+      {
+        "label": "pet",
+        "title": "虫洞派 · 宠物",
+        "url": "index.html?window=pet",
+        "width": 150,
+        "height": 170,
+        "minWidth": 150,
+        "minHeight": 170,
+        "maxWidth": 150,
+        "maxHeight": 170,
+        "x": 72,
+        "y": 72,
+        "resizable": false,
+        "fullscreen": false,
+        "transparent": true,
+        "decorations": false,
+        "shadow": false,
+        "alwaysOnTop": false,
+        "alwaysOnBottom": false,
+        "skipTaskbar": true,
+        "focus": false
+      },
+      {
+        "label": "pet-dialogue",
+        "title": "虫洞派 · 对话",
+        "url": "index.html?window=pet-dialogue",
+        "width": 360,
+        "height": 250,
+        "minWidth": 300,
+        "minHeight": 220,
+        "visible": false,
+        "resizable": true,
+        "fullscreen": false,
+        "transparent": true,
+        "decorations": false,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
