@@ -6256,13 +6256,42 @@ fn pet_layer(layer: String, app: tauri::AppHandle) -> Result<(), String> {
         not(target_os = "android")
     )
 ))]
+fn trash_paths_match(left: &Path, right: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        fn comparable(path: &Path) -> String {
+            let mut value = path.to_string_lossy().replace('/', "\\");
+            if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+                value = format!(r"\\{rest}");
+            } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+                value = rest.to_string();
+            }
+            value.trim_end_matches('\\').to_lowercase()
+        }
+        comparable(left) == comparable(right)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        left == right
+    }
+}
+
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
 fn restore_paths_from_trash(paths: &[PathBuf]) -> Result<(), String> {
     let trash_items = trash::os_limited::list().map_err(|error| error.to_string())?;
     let mut selected = Vec::new();
     for path in paths {
         if let Some(item) = trash_items
             .iter()
-            .filter(|item| item.original_path() == *path)
+            .filter(|item| trash_paths_match(&item.original_path(), path))
             .max_by_key(|item| item.time_deleted)
         {
             selected.push(item.clone());
@@ -6293,20 +6322,33 @@ fn feed_files(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<FeedEvent, String> {
+    let _operation_guard = state
+        .organize_lock
+        .lock()
+        .map_err(|_| "桌面整理操作已锁定".to_string())?;
+    let (payload, deleted) =
+        feed_paths_to_trash(&state.index, paths.into_iter().map(PathBuf::from).collect())?;
+    if let Ok(mut last_feed) = state.last_feed.lock() {
+        *last_feed = deleted;
+    }
+    let _ = app.emit("pet://fed", payload.clone());
+    Ok(payload)
+}
+
+fn feed_paths_to_trash(
+    index: &SharedIndex,
+    paths: Vec<PathBuf>,
+) -> Result<(FeedEvent, Vec<PathBuf>), String> {
     if paths.is_empty() {
         return Err("没有收到文件".to_string());
     }
     if paths.len() > 20 {
         return Err("一次最多喂给宠物 20 个项目".to_string());
     }
-    let _operation_guard = state
-        .organize_lock
-        .lock()
-        .map_err(|_| "桌面整理操作已锁定".to_string())?;
 
     let mut approved = Vec::new();
     for raw_path in paths {
-        approved.push(validate_feed_path(&state.index, Path::new(&raw_path))?);
+        approved.push(validate_feed_path(index, &raw_path)?);
     }
 
     let requested_count = approved.len();
@@ -6320,7 +6362,7 @@ fn feed_files(
                     return Err(format!("送入回收站失败：{error}"));
                 }
                 if restore_paths_from_trash(&deleted).is_ok() {
-                    let _ = scan_index(&state.index, true);
+                    let _ = scan_index(index, true);
                     return Err(format!("送入回收站失败，已恢复本次先前项目：{error}"));
                 }
                 partial_error = Some(format!(
@@ -6340,18 +6382,14 @@ fn feed_files(
                 .unwrap_or_else(|| path.display().to_string())
         })
         .collect::<Vec<_>>();
-    if let Ok(mut last_feed) = state.last_feed.lock() {
-        *last_feed = deleted;
-    }
-    let _ = scan_index(&state.index, true);
+    let _ = scan_index(index, true);
     let payload = FeedEvent {
         count: names.len(),
         failed_count: requested_count.saturating_sub(names.len()),
         names,
         warning: partial_error.clone(),
     };
-    let _ = app.emit("pet://fed", payload.clone());
-    Ok(payload)
+    Ok((payload, deleted))
 }
 
 #[tauri::command]
@@ -6899,6 +6937,35 @@ mod tests {
         assert!(validate_feed_entry_flags(false, false, false, false, false).is_err());
         assert!(validate_feed_entry_flags(false, false, false, true, false).is_ok());
         assert!(validate_feed_entry_flags(false, false, false, false, true).is_ok());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_pet_feed_round_trip_uses_the_system_recycle_bin() {
+        let workspace = TempWorkspace::new("feed-recycle-round-trip");
+        let index = test_index(&workspace);
+        let file = index.desktop_path.join("wormhole-pie-feed-round-trip.txt");
+        fs::write(&file, b"wormhole pie recycle-bin verification").unwrap();
+        let canonical = file.canonicalize().unwrap();
+
+        let (event, deleted) = feed_paths_to_trash(&index, vec![canonical.clone()]).unwrap();
+        assert_eq!(event.count, 1);
+        assert_eq!(event.failed_count, 0);
+        assert_eq!(deleted, vec![canonical.clone()]);
+        assert!(
+            !canonical.exists(),
+            "file should be inside the Windows recycle bin"
+        );
+
+        restore_paths_from_trash(&deleted).unwrap();
+        assert!(
+            canonical.exists(),
+            "undo should restore the file to its original path"
+        );
+        assert_eq!(
+            fs::read(&canonical).unwrap(),
+            b"wormhole pie recycle-bin verification"
+        );
     }
 
     #[test]
