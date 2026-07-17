@@ -51,6 +51,7 @@ import {
 import {
   AnimationEvent as ReactAnimationEvent,
   CSSProperties,
+  DragEvent as ReactDragEvent,
   FormEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -2006,6 +2007,7 @@ function DesktopPetWindow() {
   const [dropHover, setDropHover] = useState(false);
   const [feedMessage, setFeedMessage] = useState("拖动我");
   const [snackName, setSnackName] = useState("");
+  const lastDropRef = useRef<{ key: string; at: number } | null>(null);
   const petRef = useRef<HTMLDivElement>(null);
   const sendRuntimeSignal = useCallback((signal: string, payload?: Record<string, unknown>, transactionId?: string) => {
     const petId = runtimeSnapshot?.petId ?? getPetAssetId(species);
@@ -2030,6 +2032,30 @@ function DesktopPetWindow() {
       if (dragged) void sendRuntimeSignal("pointer_release_slow").catch(console.error);
     },
   );
+
+  const confirmFileDrop = useCallback((paths: string[]) => {
+    const cleanPaths = [...new Set(paths.filter((path) => path.trim()))];
+    if (!cleanPaths.length) {
+      setFeedMessage("请从桌面或虫洞派资料库拖入文件");
+      return;
+    }
+    const key = cleanPaths.join("\n").toLowerCase();
+    const now = Date.now();
+    if (lastDropRef.current?.key === key && now - lastDropRef.current.at < 800) return;
+    lastDropRef.current = { key, at: now };
+    const name = cleanPaths[0]?.split(/[\\/]/).pop() ?? "文件";
+    const transactionId = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : makeId("feed");
+    setSnackName(name);
+    setDropHover(false);
+    setFeeding(true);
+    setFeedMessage("啊呜——");
+    void sendRuntimeSignal("confirmed_file_drop", { paths: cleanPaths, name }, transactionId)
+      .catch((error) => {
+        console.error(error);
+        setFeeding(false);
+        setFeedMessage("这个文件我不能吃");
+      });
+  }, [sendRuntimeSignal]);
 
   useEffect(() => {
     let cleanup: undefined | (() => void);
@@ -2085,19 +2111,7 @@ function DesktopPetWindow() {
         setDropHover(false);
         setFeedMessage("拖动我");
       } else if (event.type === "drop") {
-        const name = event.paths[0]?.split(/[\\/]/).pop() ?? "文件";
-        const transactionId = typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : makeId("feed");
-        setSnackName(name);
-        setDropHover(false);
-        setFeeding(true);
-        setFeedMessage("啊呜——");
-        void sendRuntimeSignal("confirmed_file_drop", { paths: event.paths, name }, transactionId)
-          .catch((error) => {
-            console.error(error);
-            if (cancelled) return;
-            setFeeding(false);
-            setFeedMessage("这个我不能吃");
-          });
+        confirmFileDrop(event.paths);
       }
     }).then((cleanup) => {
       if (cancelled) cleanup();
@@ -2107,7 +2121,33 @@ function DesktopPetWindow() {
       cancelled = true;
       unlisten?.();
     };
-  }, [sendRuntimeSignal]);
+  }, [confirmFileDrop]);
+
+  const handleDomDragOver = (event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setDropHover(true);
+    setFeedMessage("放开喂给我");
+  };
+
+  const handleDomDragLeave = (event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const nextTarget = event.relatedTarget;
+    if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+      setDropHover(false);
+      setFeedMessage("拖动我");
+    }
+  };
+
+  const handleDomDrop = (event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const paths = Array.from(event.dataTransfer.files)
+      .map((file) => (file as File & { path?: string }).path ?? "")
+      .filter(Boolean);
+    confirmFileDrop(paths);
+  };
 
   useEffect(() => {
     let feedCleanup: undefined | (() => void);
@@ -2153,6 +2193,10 @@ function DesktopPetWindow() {
       className={`desktop-pet-window ${petClassName(species, theme, evolution)} action-${spriteAction} ${dropHover ? "is-drop-target" : ""}`}
       data-tauri-drag-region
       {...dragHandlers}
+      onDragOver={handleDomDragOver}
+      onDragEnter={handleDomDragOver}
+      onDragLeave={handleDomDragLeave}
+      onDrop={handleDomDrop}
       onContextMenu={(event) => {
         event.preventDefault();
         void showPetContextMenu().catch(console.error);
