@@ -5443,6 +5443,15 @@ fn pet_layer(layer: String, app: tauri::AppHandle) -> Result<(), String> {
     set_pet_layer(&app, &layer)
 }
 
+#[cfg(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+))]
 fn restore_paths_from_trash(paths: &[PathBuf]) -> Result<(), String> {
     let trash_items = trash::os_limited::list().map_err(|error| error.to_string())?;
     let mut selected = Vec::new();
@@ -5459,6 +5468,19 @@ fn restore_paths_from_trash(paths: &[PathBuf]) -> Result<(), String> {
         return Err("回收站中找不到完整的待恢复记录".to_string());
     }
     trash::os_limited::restore_all(selected).map_err(|error| error.to_string())
+}
+
+#[cfg(not(any(
+    target_os = "windows",
+    all(
+        unix,
+        not(target_os = "macos"),
+        not(target_os = "ios"),
+        not(target_os = "android")
+    )
+)))]
+fn restore_paths_from_trash(_paths: &[PathBuf]) -> Result<(), String> {
+    Err("当前系统暂不支持从废纸篓自动恢复，请在废纸篓中手动恢复".to_string())
 }
 
 #[tauri::command]
