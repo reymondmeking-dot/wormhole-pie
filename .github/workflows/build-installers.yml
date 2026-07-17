@@ -70,14 +70,23 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Build universal DMG
-        run: pnpm tauri build --target universal-apple-darwin --bundles dmg --ci
+        run: |
+          if [ -n "$WORMHOLE_APPLE_CERTIFICATE" ]; then
+            export APPLE_CERTIFICATE="$WORMHOLE_APPLE_CERTIFICATE"
+            export APPLE_CERTIFICATE_PASSWORD="$WORMHOLE_APPLE_CERTIFICATE_PASSWORD"
+            export APPLE_SIGNING_IDENTITY="$WORMHOLE_APPLE_SIGNING_IDENTITY"
+            export APPLE_ID="$WORMHOLE_APPLE_ID"
+            export APPLE_PASSWORD="$WORMHOLE_APPLE_PASSWORD"
+            export APPLE_TEAM_ID="$WORMHOLE_APPLE_TEAM_ID"
+          fi
+          pnpm tauri build --target universal-apple-darwin --bundles dmg --ci
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WORMHOLE_APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          WORMHOLE_APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          WORMHOLE_APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          WORMHOLE_APPLE_ID: ${{ secrets.APPLE_ID }}
+          WORMHOLE_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          WORMHOLE_APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
       - uses: actions/upload-artifact@v4
         with:
