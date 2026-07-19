@@ -1,5 +1,5 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -454,6 +454,32 @@ struct AgentApiConfig {
 struct AgentApiTestResult {
     reachable: bool,
     detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchProviderSummary {
+    id: String,
+    app_type: String,
+    name: String,
+    is_current: bool,
+    model: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchStatus {
+    detected: bool,
+    database_path: Option<String>,
+    providers: Vec<CcSwitchProviderSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CcSwitchApplyRequest {
+    app_type: String,
+    provider_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -9107,6 +9133,243 @@ async fn save_agent_api_config(config: AgentApiConfig) -> Result<(), String> {
         .map_err(|error| format!("保存 API 配置任务异常：{error}"))?
 }
 
+fn cc_switch_database_path() -> Option<PathBuf> {
+    agent_user_home().map(|home| home.join(".cc-switch").join("cc-switch.db"))
+}
+
+fn cc_switch_app_type(value: &str) -> Result<&str, String> {
+    match value.trim() {
+        "claude" | "codex" | "hermes" => Ok(value.trim()),
+        _ => Err("不支持的 CC Switch Agent 类型".to_string()),
+    }
+}
+
+fn json_string_at<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn unquote_toml_value(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        return serde_json::from_str::<String>(value).ok();
+    }
+    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        return Some(value[1..value.len() - 1].to_string());
+    }
+    None
+}
+
+fn toml_assignment(line: &str, key: &str) -> Option<String> {
+    let clean = line.split('#').next()?.trim();
+    let (candidate, value) = clean.split_once('=')?;
+    (candidate.trim() == key)
+        .then(|| unquote_toml_value(value))
+        .flatten()
+}
+
+fn codex_live_fields(config: &str) -> (Option<String>, Option<String>) {
+    let mut model = None;
+    let mut provider = None;
+    let mut section = String::new();
+    let mut provider_urls = BTreeMap::<String, String>::new();
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            section = trimmed[1..trimmed.len() - 1].trim().to_string();
+            continue;
+        }
+        if section.is_empty() {
+            model = model.or_else(|| toml_assignment(trimmed, "model"));
+            provider = provider.or_else(|| toml_assignment(trimmed, "model_provider"));
+        } else if let Some(name) = section.strip_prefix("model_providers.") {
+            if let Some(url) = toml_assignment(trimmed, "base_url") {
+                provider_urls.insert(name.trim_matches(['"', '\'']).to_string(), url);
+            }
+        }
+    }
+    let endpoint = provider.and_then(|name| provider_urls.remove(&name));
+    (model, endpoint)
+}
+
+fn cc_switch_config(app_type: &str, settings: &str) -> Result<AgentApiConfig, String> {
+    let app_type = cc_switch_app_type(app_type)?;
+    let value: serde_json::Value = serde_json::from_str(settings)
+        .map_err(|_| "CC Switch Provider 配置格式无效".to_string())?;
+    let (api_key, base_url, model) = match app_type {
+        "claude" => {
+            let key = json_string_at(&value, &["env", "ANTHROPIC_AUTH_TOKEN"])
+                .or_else(|| json_string_at(&value, &["env", "ANTHROPIC_API_KEY"]));
+            let url = json_string_at(&value, &["env", "ANTHROPIC_BASE_URL"]);
+            let model = json_string_at(&value, &["env", "ANTHROPIC_MODEL"])
+                .or_else(|| json_string_at(&value, &["env", "ANTHROPIC_DEFAULT_SONNET_MODEL"]))
+                .or_else(|| json_string_at(&value, &["env", "ANTHROPIC_DEFAULT_OPUS_MODEL"]));
+            (key, url, model)
+        }
+        "codex" => {
+            let key = json_string_at(&value, &["auth", "OPENAI_API_KEY"]);
+            let live = json_string_at(&value, &["config"]).unwrap_or_default();
+            let (model, endpoint) = codex_live_fields(live);
+            return Ok(AgentApiConfig {
+                connector_id: app_type.to_string(),
+                api_key: key.unwrap_or_default().to_string(),
+                base_url: endpoint
+                    .ok_or_else(|| "CC Switch Codex 配置缺少 base_url".to_string())?,
+                model: model.unwrap_or_default(),
+            });
+        }
+        "hermes" => {
+            let model = json_string_at(&value, &["model"]).or_else(|| {
+                value
+                    .get("models")?
+                    .as_array()?
+                    .first()
+                    .and_then(|item| {
+                        item.as_str()
+                            .or_else(|| item.get("id").and_then(|v| v.as_str()))
+                            .or_else(|| item.get("name").and_then(|v| v.as_str()))
+                    })
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            });
+            (
+                json_string_at(&value, &["api_key"]),
+                json_string_at(&value, &["base_url"]),
+                model,
+            )
+        }
+        _ => unreachable!(),
+    };
+    Ok(AgentApiConfig {
+        connector_id: app_type.to_string(),
+        api_key: api_key.unwrap_or_default().to_string(),
+        base_url: base_url
+            .ok_or_else(|| "CC Switch Provider 配置缺少接口地址".to_string())?
+            .to_string(),
+        model: model.unwrap_or_default().to_string(),
+    })
+}
+
+fn safe_endpoint(value: &str) -> Option<String> {
+    let url = url::Url::parse(value).ok()?;
+    let host = url.host_str()?;
+    let port = url
+        .port()
+        .map(|value| format!(":{value}"))
+        .unwrap_or_default();
+    Some(format!("{}://{host}{port}", url.scheme()))
+}
+
+fn cc_switch_provider_summary(
+    id: String,
+    app_type: String,
+    name: String,
+    settings: &str,
+    is_current: bool,
+) -> CcSwitchProviderSummary {
+    let config = cc_switch_config(&app_type, settings).ok();
+    CcSwitchProviderSummary {
+        id,
+        app_type,
+        name,
+        is_current,
+        model: config
+            .as_ref()
+            .map(|value| value.model.clone())
+            .filter(|value| !value.is_empty()),
+        endpoint: config
+            .as_ref()
+            .and_then(|value| safe_endpoint(&value.base_url)),
+    }
+}
+
+fn open_cc_switch_database(path: &Path) -> Result<Connection, String> {
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "无法只读打开 CC Switch 数据库".to_string())
+}
+
+fn get_cc_switch_status_blocking() -> Result<CcSwitchStatus, String> {
+    let Some(path) = cc_switch_database_path() else {
+        return Ok(CcSwitchStatus {
+            detected: false,
+            database_path: None,
+            providers: Vec::new(),
+        });
+    };
+    if !path.is_file() {
+        return Ok(CcSwitchStatus {
+            detected: false,
+            database_path: Some(path.to_string_lossy().to_string()),
+            providers: Vec::new(),
+        });
+    }
+    let connection = open_cc_switch_database(&path)?;
+    let mut statement = connection.prepare(
+        "SELECT id, app_type, name, settings_config, is_current FROM providers WHERE app_type IN ('claude','codex','hermes') ORDER BY app_type, is_current DESC, sort_index, name",
+    ).map_err(|_| "无法读取 CC Switch Provider 列表".to_string())?;
+    let providers = statement
+        .query_map([], |row| {
+            Ok(cc_switch_provider_summary(
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                &row.get::<_, String>(3)?,
+                row.get(4)?,
+            ))
+        })
+        .map_err(|_| "无法查询 CC Switch Provider".to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "无法解析 CC Switch Provider".to_string())?;
+    Ok(CcSwitchStatus {
+        detected: true,
+        database_path: Some(path.to_string_lossy().to_string()),
+        providers,
+    })
+}
+
+#[tauri::command]
+async fn get_cc_switch_status() -> Result<CcSwitchStatus, String> {
+    tauri::async_runtime::spawn_blocking(get_cc_switch_status_blocking)
+        .await
+        .map_err(|error| format!("CC Switch 检测任务异常：{error}"))?
+}
+
+fn apply_cc_switch_provider_blocking(request: CcSwitchApplyRequest) -> Result<(), String> {
+    let app_type = cc_switch_app_type(&request.app_type)?.to_string();
+    let provider_id = request.provider_id.trim();
+    if provider_id.is_empty()
+        || provider_id.len() > 256
+        || provider_id.chars().any(char::is_control)
+    {
+        return Err("CC Switch Provider ID 无效".to_string());
+    }
+    let path = cc_switch_database_path().ok_or_else(|| "无法定位用户目录".to_string())?;
+    let connection = open_cc_switch_database(&path)?;
+    let settings = connection
+        .query_row(
+            "SELECT settings_config FROM providers WHERE id = ?1 AND app_type = ?2",
+            params![provider_id, app_type],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| "无法查询 CC Switch Provider".to_string())?
+        .ok_or_else(|| "没有找到指定的 CC Switch Provider".to_string())?;
+    save_agent_api_config_blocking(cc_switch_config(&app_type, &settings)?)
+}
+
+#[tauri::command]
+async fn apply_cc_switch_provider(request: CcSwitchApplyRequest) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || apply_cc_switch_provider_blocking(request))
+        .await
+        .map_err(|error| format!("CC Switch 配置应用任务异常：{error}"))?
+}
+
 #[tauri::command]
 fn pick_dialogue_files(
     app: tauri::AppHandle,
@@ -10364,6 +10627,8 @@ pub fn run() {
             install_agent,
             test_agent_api,
             save_agent_api_config,
+            get_cc_switch_status,
+            apply_cc_switch_provider,
             pick_dialogue_files,
             get_agent_task_status,
             get_agent_task_result,
@@ -11528,5 +11793,89 @@ mod tests {
         );
         assert!(error.contains("退出全屏失败"));
         assert!(error.contains("显示窗口失败"));
+    }
+
+    #[test]
+    fn cc_switch_extracts_supported_provider_formats() {
+        let claude = cc_switch_config(
+            "claude",
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"secret-claude","ANTHROPIC_BASE_URL":"https://claude.example/v1","ANTHROPIC_MODEL":"claude-test"}}"#,
+        ).unwrap();
+        assert_eq!(claude.connector_id, "claude");
+        assert_eq!(claude.base_url, "https://claude.example/v1");
+        assert_eq!(claude.model, "claude-test");
+
+        let codex = cc_switch_config(
+            "codex",
+            r#"{"auth":{"OPENAI_API_KEY":"secret-codex"},"config":"model_provider = \"selected\"\nmodel = \"gpt-test\"\n[model_providers.other]\nbase_url = \"https://wrong.example/v1\"\n[model_providers.selected]\nbase_url = \"https://codex.example/v1\""}"#,
+        ).unwrap();
+        assert_eq!(codex.base_url, "https://codex.example/v1");
+        assert_eq!(codex.model, "gpt-test");
+
+        let hermes = cc_switch_config(
+            "hermes",
+            r#"{"api_key":"secret-hermes","base_url":"https://hermes.example/v1","models":[{"id":"hermes-test"}]}"#,
+        ).unwrap();
+        assert_eq!(hermes.base_url, "https://hermes.example/v1");
+        assert_eq!(hermes.model, "hermes-test");
+    }
+
+    #[test]
+    fn cc_switch_summary_never_serializes_credentials() {
+        let summary = cc_switch_provider_summary(
+            "provider-1".to_string(),
+            "claude".to_string(),
+            "Work profile".to_string(),
+            r#"{"env":{"ANTHROPIC_API_KEY":"do-not-leak","ANTHROPIC_BASE_URL":"https://user:password@example.com/private/path?token=hidden","ANTHROPIC_MODEL":"claude-test"}}"#,
+            true,
+        );
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert_eq!(summary.endpoint.as_deref(), Some("https://example.com"));
+        assert!(!serialized.contains("do-not-leak"));
+        assert!(!serialized.contains("password"));
+        assert!(!serialized.contains("private/path"));
+        assert!(!serialized.contains("token"));
+    }
+
+    #[test]
+    fn installed_cc_switch_database_is_readable_without_serializing_settings() {
+        let Some(path) = cc_switch_database_path() else {
+            return;
+        };
+        if !path.is_file() {
+            return;
+        }
+        let status = get_cc_switch_status_blocking().unwrap();
+        assert!(status.detected);
+        assert!(!status.providers.is_empty());
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains("settings_config"));
+        assert!(!serialized.contains("OPENAI_API_KEY"));
+        assert!(!serialized.contains("ANTHROPIC_AUTH_TOKEN"));
+
+        let connection = open_cc_switch_database(&path).unwrap();
+        let mut statement = connection.prepare(
+            "SELECT app_type, settings_config FROM providers WHERE app_type IN ('claude','codex','hermes')",
+        ).unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        for row in rows {
+            let (app_type, settings) = row.unwrap();
+            if let Ok(config) = cc_switch_config(&app_type, &settings) {
+                if !config.api_key.is_empty() {
+                    assert!(!serialized.contains(&config.api_key));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cc_switch_rejects_unknown_app_types() {
+        assert!(cc_switch_config("unknown", "{}").is_err());
+        assert!(cc_switch_app_type("codex\n").is_ok());
+        assert!(cc_switch_app_type("codex-other").is_err());
     }
 }

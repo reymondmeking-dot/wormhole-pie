@@ -1,9 +1,11 @@
-import { CheckCircle2, ChevronDown, Download, FolderOpen, KeyRound, LoaderCircle, PlugZap, ServerCog, ShieldCheck, Wifi } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { CheckCircle2, ChevronDown, Download, FolderOpen, KeyRound, LoaderCircle, RefreshCw, ServerCog, ShieldCheck, Shuffle, Wifi } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { AppLocale } from "../i18n";
 import { usePersistentState } from "../hooks/usePersistentState";
 import {
+  applyCcSwitchProvider,
   getAgentDefaultInstallDirectory,
+  getCcSwitchStatus,
   installAgent,
   pickDirectory,
   saveAgentApiConfig,
@@ -11,6 +13,7 @@ import {
   type AgentApiConfig,
   type AgentConnectorId,
   type AgentConnectorStatus,
+  type CcSwitchStatus,
 } from "../lib/desktop";
 
 type Props = {
@@ -43,11 +46,29 @@ export function AgentManagerPanel({ locale, connectors, workspace, onWorkspace, 
   const [testing, setTesting] = useState(false);
   const [apiMessage, setApiMessage] = useState("");
   const [saving, setSaving] = useState(false);
+  const [ccStatus, setCcStatus] = useState<CcSwitchStatus | null>(null);
+  const [ccLoading, setCcLoading] = useState(false);
+  const [ccApplying, setCcApplying] = useState<string | null>(null);
+  const [ccMessage, setCcMessage] = useState("");
 
   useEffect(() => {
     if (installDirectory.trim()) return;
     getAgentDefaultInstallDirectory().then(setInstallDirectory).catch(() => undefined);
   }, [installDirectory, setInstallDirectory]);
+
+  const refreshCcSwitch = useCallback(async () => {
+    setCcLoading(true);
+    setCcMessage("");
+    try {
+      setCcStatus(await getCcSwitchStatus());
+    } catch (error) {
+      setCcMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCcLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void refreshCcSwitch(); }, [refreshCcSwitch]);
 
   const selectedConnector = useMemo(
     () => connectors.find((connector) => connector.id === selected),
@@ -124,6 +145,23 @@ export function AgentManagerPanel({ locale, connectors, workspace, onWorkspace, 
     }
   };
 
+  const handleCcApply = async (providerId: string) => {
+    if (ccApplying) return;
+    setCcApplying(providerId);
+    setCcMessage("");
+    try {
+      await applyCcSwitchProvider(selected, providerId);
+      setCcMessage(copy(locale, "已安全应用到本机 Agent；CC Switch 数据库未被修改。", "Applied safely to the local Agent; the CC Switch database was not modified."));
+      onInstalled();
+    } catch (error) {
+      setCcMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCcApplying(null);
+    }
+  };
+
+  const selectedCcProviders = ccStatus?.providers.filter((provider) => provider.appType === selected) ?? [];
+
   return (
     <div className="agent-manager-panel" data-testid="agent-manager-panel">
       <div className="agent-directory-grid">
@@ -169,6 +207,41 @@ export function AgentManagerPanel({ locale, connectors, workspace, onWorkspace, 
             <button type="button" disabled={saving || !selectedApi.baseUrl.trim()} onClick={() => void handleSave()}>{saving ? <LoaderCircle className="is-spinning" size={14} /> : <ShieldCheck size={14} />}{copy(locale, "保存配置", "Save configuration")}</button>
           </div>
           {apiMessage ? <p className="agent-manager-feedback" role="status">{apiMessage}</p> : null}
+        </div>
+      </details>
+
+      <details className="agent-api-details cc-switch-details">
+        <summary><span><Shuffle size={14} />{copy(locale, "CC Switch 兼容配置", "CC Switch compatible profiles")}</span><ChevronDown size={14} /></summary>
+        <div className="agent-api-body cc-switch-body">
+          <div className="agent-api-tabs">
+            {connectors.map((connector) => <button type="button" key={connector.id} className={selected === connector.id ? "is-active" : ""} onClick={() => { setSelected(connector.id); setCcMessage(""); }}>{connector.name}</button>)}
+          </div>
+          <div className="cc-switch-toolbar">
+            <p>{copy(locale, "只读发现本机配置；密钥不会进入前端，也不会修改 CC Switch 当前状态。", "Profiles are discovered read-only; secrets never enter the UI and CC Switch state is not changed.")}</p>
+            <button type="button" disabled={ccLoading} onClick={() => void refreshCcSwitch()} aria-label={copy(locale, "刷新 CC Switch", "Refresh CC Switch")}>
+              <RefreshCw size={12} className={ccLoading ? "is-spinning" : ""} />
+            </button>
+          </div>
+          {!ccStatus?.detected ? (
+            <p className="cc-switch-empty">{ccLoading ? copy(locale, "正在检测…", "Detecting…") : copy(locale, "未检测到 ~/.cc-switch/cc-switch.db", "No ~/.cc-switch/cc-switch.db detected")}</p>
+          ) : selectedCcProviders.length ? (
+            <div className="cc-switch-list">
+              {selectedCcProviders.map((provider) => (
+                <article key={provider.id} className={provider.isCurrent ? "is-current" : ""}>
+                  <div>
+                    <strong data-no-i18n>{provider.name}</strong>
+                    <small data-no-i18n>{[provider.model, provider.endpoint].filter(Boolean).join(" · ") || "—"}</small>
+                  </div>
+                  {provider.isCurrent ? <span>{copy(locale, "CC 当前", "CC current")}</span> : null}
+                  <button type="button" disabled={Boolean(ccApplying)} onClick={() => void handleCcApply(provider.id)}>
+                    {ccApplying === provider.id ? <LoaderCircle className="is-spinning" size={12} /> : <Shuffle size={12} />}
+                    {copy(locale, "应用", "Apply")}
+                  </button>
+                </article>
+              ))}
+            </div>
+          ) : <p className="cc-switch-empty">{copy(locale, `CC Switch 中没有 ${selectedConnector?.name ?? selected} 配置`, `No ${selectedConnector?.name ?? selected} profiles in CC Switch`)}</p>}
+          {ccMessage ? <p className="agent-manager-feedback" role="status">{ccMessage}</p> : null}
         </div>
       </details>
     </div>

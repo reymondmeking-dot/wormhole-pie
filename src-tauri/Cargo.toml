@@ -1,6 +1,6 @@
 [package]
 name = "wormhole-pie"
-version = "0.2.0"
+version = "0.3.0"
 description = "Wormhole Pie - a local-first cross-platform desktop Agent Pet"
 authors = ["Wormhole Pie"]
 edition = "2021"

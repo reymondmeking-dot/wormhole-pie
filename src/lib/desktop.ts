@@ -106,6 +106,21 @@ export type AgentApiTestResult = {
   detail: string;
 };
 
+export type CcSwitchProviderSummary = {
+  id: string;
+  appType: AgentConnectorId;
+  name: string;
+  isCurrent: boolean;
+  model?: string;
+  endpoint?: string;
+};
+
+export type CcSwitchStatus = {
+  detected: boolean;
+  databasePath?: string;
+  providers: CcSwitchProviderSummary[];
+};
+
 export type LibraryRestoreResult = {
   restoredCount: number;
   conflictCount: number;
@@ -583,6 +598,29 @@ export async function testAgentApi(config: AgentApiConfig): Promise<AgentApiTest
 export async function saveAgentApiConfig(config: AgentApiConfig): Promise<void> {
   if (!isTauri()) return;
   await invoke("save_agent_api_config", { config });
+}
+
+export async function getCcSwitchStatus(): Promise<CcSwitchStatus> {
+  if (!isTauri()) {
+    return {
+      detected: true,
+      databasePath: "C:\\Users\\你\\.cc-switch\\cc-switch.db",
+      providers: [
+        { id: "preview-codex", appType: "codex", name: "Codex 工作配置", isCurrent: true, model: "gpt-5.1-codex", endpoint: "https://api.openai.com" },
+        { id: "preview-claude", appType: "claude", name: "Claude 创作配置", isCurrent: true, model: "claude-sonnet-4-5", endpoint: "https://api.anthropic.com" },
+        { id: "preview-hermes", appType: "hermes", name: "Hermes 本地配置", isCurrent: false, model: "hermes-4-405b", endpoint: "https://api.openai.com" },
+      ],
+    };
+  }
+  return invoke<CcSwitchStatus>("get_cc_switch_status");
+}
+
+export async function applyCcSwitchProvider(appType: AgentConnectorId, providerId: string): Promise<void> {
+  if (!isTauri()) {
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 350));
+    return;
+  }
+  await invoke("apply_cc_switch_provider", { request: { appType, providerId } });
 }
 
 export async function showMainFromTray(): Promise<void> {

@@ -2767,12 +2767,14 @@ function PetDialogueWindow() {
       busyHeartbeatFresh={taskTiming.heartbeatFresh}
       busyCancelling={agentTaskStatus?.connectorId === connectorId && (agentTaskStatus.state === "cancelling" || agentTaskStatus.cancelRequested === true)}
       connectorId={connectorId}
+      mode={selectedSession.mode}
       connectors={connectors}
       resultFiles={selectedSession.resultFiles}
       onClose={() => void hidePetDialogue().catch(console.error)}
       onSubmit={sendCommand}
       onMic={recognize}
       onConnector={setConnectorId}
+      onMode={(mode) => updatePetDialogueSession(connectorId, { mode })}
       onDraftChange={(draft) => updatePetDialogueSession(connectorId, { draft })}
       onAttachmentPathsChange={(next) => updatePetDialogueSession(connectorId, (current) => ({
         attachmentPaths: typeof next === "function" ? next(current.attachmentPaths) : next,
@@ -4759,12 +4761,14 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
           busyHeartbeatFresh={agentTaskTiming.heartbeatFresh}
           busyCancelling={agentTaskStatus?.connectorId === agentConnector && (agentTaskStatus.state === "cancelling" || agentTaskStatus.cancelRequested === true)}
           connectorId={agentConnector}
+          mode={activeDialogueSession.mode}
           connectors={agentConnectors}
           resultFiles={agentResultFiles}
           onClose={() => setDialogueOpen(false)}
           onSubmit={(submission) => { void handleCommand({ ...submission, connectorId: agentConnector }); }}
           onMic={handleMic}
           onConnector={setAgentConnector}
+          onMode={(mode) => updateDialogueSession(agentConnector, { mode })}
           onDraftChange={(draft) => updateDialogueSession(agentConnector, { draft })}
           onAttachmentPathsChange={(next) => updateDialogueSession(agentConnector, (current) => ({
             attachmentPaths: typeof next === "function" ? next(current.attachmentPaths) : next,

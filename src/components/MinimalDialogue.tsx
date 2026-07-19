@@ -2,7 +2,7 @@ import { ArrowUp, Bot, ChevronDown, ExternalLink, FileText, FileUp, LoaderCircle
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { MAX_DIALOGUE_ATTACHMENTS, normalizeDialogueAttachmentPaths } from "../dialogueSessions";
-import type { DialogueMessage } from "../dialogueSessions";
+import type { DialogueMessage, DialogueMode } from "../dialogueSessions";
 import { isTauri, pickDialogueFiles, subscribeToWindowFileDrop } from "../lib/desktop";
 import type { AgentConnectorStatus, AgentResultFile, DialogueConnectorId, DialogueSubmission } from "../lib/desktop";
 
@@ -23,12 +23,14 @@ type Props = {
   busyHeartbeatFresh?: boolean;
   busyCancelling?: boolean;
   connectorId: DialogueConnectorId;
+  mode: DialogueMode;
   connectors: AgentConnectorStatus[];
   resultFiles?: AgentResultFile[];
   onClose: () => void;
   onSubmit: (submission: DialogueSubmission) => void | Promise<void>;
   onMic: () => Promise<string | null>;
   onConnector: (connectorId: DialogueConnectorId) => void;
+  onMode: (mode: DialogueMode) => void;
   onDraftChange: (draft: string) => void;
   onAttachmentPathsChange: (next: string[] | ((current: string[]) => string[])) => void;
   onOpenResultFile?: (file: AgentResultFile) => void | Promise<void>;
@@ -37,6 +39,19 @@ type Props = {
 
 const EMPTY_RESULT_FILES: AgentResultFile[] = [];
 const EMPTY_MESSAGES: DialogueMessage[] = [];
+function dialogueModeOptions(english: boolean): ReadonlyArray<{ id: DialogueMode; label: string; title: string }> {
+  return english ? [
+    { id: "chat", label: "Chat", title: "Discuss and explain; make no changes unless explicitly requested" },
+    { id: "plan", label: "Plan", title: "Analyze and plan only; do not run commands or modify files" },
+    { id: "execute", label: "Run", title: "Run commands, modify files, and verify results" },
+    { id: "review", label: "Review", title: "Prioritize findings and risks; do not modify files by default" },
+  ] : [
+    { id: "chat", label: "对话", title: "讨论与解释；除非明确要求，否则不修改文件" },
+    { id: "plan", label: "规划", title: "只分析和制定计划，不执行命令或修改文件" },
+    { id: "execute", label: "执行", title: "允许执行命令、修改文件并验证结果" },
+    { id: "review", label: "审查", title: "优先诊断问题与风险，默认不修改文件" },
+  ];
+}
 type DialogueResizeDirection = Parameters<ReturnType<typeof getCurrentWindow>["startResizeDragging"]>[0];
 
 const resizeHandles: ReadonlyArray<readonly [string, DialogueResizeDirection]> = [
@@ -89,17 +104,21 @@ export function MinimalDialogue({
   busyHeartbeatFresh = false,
   busyCancelling = false,
   connectorId,
+  mode,
   connectors,
   resultFiles = EMPTY_RESULT_FILES,
   onClose,
   onSubmit,
   onMic,
   onConnector,
+  onMode,
   onDraftChange,
   onAttachmentPathsChange,
   onOpenResultFile,
   onStop,
 }: Props) {
+  const english = document.documentElement.lang.toLowerCase().startsWith("en");
+  const dialogueModes = dialogueModeOptions(english);
   const [attachmentNotice, setAttachmentNotice] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const [pickerBusy, setPickerBusy] = useState(false);
@@ -285,6 +304,20 @@ export function MinimalDialogue({
           </div>
           <button onClick={onClose} aria-label="关闭对话"><X size={16} /></button>
         </header>
+
+        <div className={`dialogue-mode-switcher ${connectorId === "local" ? "is-local" : ""}`} role="group" aria-label={english ? "Agent conversation mode" : "智能体对话模式"}>
+          {dialogueModes.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              className={mode === item.id ? "is-active" : ""}
+              disabled={busy || connectorId === "local"}
+              onClick={() => onMode(item.id)}
+              title={connectorId === "local" ? (english ? "Local assistant always uses Chat mode" : "本地助手固定使用对话模式") : item.title}
+              aria-pressed={mode === item.id}
+            >{item.label}</button>
+          ))}
+        </div>
 
         <div className="minimal-dialogue-messages" ref={messagesRef} aria-live="polite" aria-busy={busy}>
           {visibleMessages.map((message) => message.role === "user" ? (

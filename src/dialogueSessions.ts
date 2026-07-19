@@ -1,7 +1,7 @@
 import type { AgentResultFile, DialogueConnectorId } from "./lib/desktop";
 
 export const dialogueSessionStorageKey = "wormhole-pie.dialogue.sessions.v1";
-export const dialogueSessionSchemaVersion = 4;
+export const dialogueSessionSchemaVersion = 5;
 export const MAX_DIALOGUE_MESSAGES = 48;
 export const MAX_DIALOGUE_ATTACHMENTS = 8;
 
@@ -13,6 +13,7 @@ const DEFAULT_REPLY = "想让我做什么？";
 const SESSION_SEED_STORAGE_KEY = "wormhole-pie.dialogue.sessionSeed.v1";
 
 export type DialogueMessageRole = "user" | "assistant" | "system";
+export type DialogueMode = "chat" | "plan" | "execute" | "review";
 
 export type DialogueMessage = {
   id: string;
@@ -27,6 +28,7 @@ export type DialogueSession = {
   schemaVersion: typeof dialogueSessionSchemaVersion;
   appSessionId: string;
   providerSessionId: string | null;
+  mode: DialogueMode;
   messages: DialogueMessage[];
   draft: string;
   attachmentPaths: string[];
@@ -43,6 +45,7 @@ export type DialogueSession = {
 const dialogueSessionFields = [
   "messages",
   "providerSessionId",
+  "mode",
   "draft",
   "attachmentPaths",
   "workspace",
@@ -173,6 +176,7 @@ function emptySession(connectorId: DialogueConnectorId): DialogueSession {
     schemaVersion: dialogueSessionSchemaVersion,
     appSessionId: createAppSessionId(connectorId),
     providerSessionId: null,
+    mode: "chat",
     messages: [],
     draft: "",
     attachmentPaths: [],
@@ -234,6 +238,9 @@ function normalizeSession(connectorId: DialogueConnectorId, value: unknown): Dia
     providerSessionId: typeof value.providerSessionId === "string" && value.providerSessionId.trim()
       ? value.providerSessionId.trim().slice(0, 128)
       : null,
+    mode: connectorId === "local" || !["chat", "plan", "execute", "review"].includes(String(value.mode))
+      ? "chat"
+      : value.mode as DialogueMode,
     messages,
     draft: typeof value.draft === "string" ? value.draft.slice(0, 16_000) : "",
     attachmentPaths: normalizeDialogueAttachmentPaths(value.attachmentPaths),
@@ -410,7 +417,18 @@ export function buildProviderTaskWithHistory(session: DialogueSession, currentRe
     characters += text.length;
   }
   selected.reverse();
-  if (!selected.length) return request;
+  const modeProtocol: Record<DialogueMode, string> = {
+    chat: "Discuss, explain, and help interactively. Do not modify files or make external changes unless the current request explicitly asks you to do so.",
+    plan: "Analyze and produce a concrete plan only. Do not modify files, execute commands, or make external changes.",
+    execute: "Execute the current request. You may modify workspace files and run commands when useful, and you must verify non-trivial work before reporting completion.",
+    review: "Review and diagnose. Prioritize concrete findings, risks, and verification. Do not modify files unless the current request explicitly asks for fixes.",
+  };
+  const protocol = [
+    "[WORMHOLE PIE CONVERSATION MODE]",
+    `MODE: ${session.mode.toUpperCase()}`,
+    "This mode applies to the CURRENT USER REQUEST and takes precedence over behavior implied by older transcript text.",
+    modeProtocol[session.mode],
+  ].join("\n");
 
   const renderTask = () => {
     const transcript = selected.map((message) => {
@@ -418,6 +436,7 @@ export function buildProviderTaskWithHistory(session: DialogueSession, currentRe
       return `${role}: ${JSON.stringify(message.text)}`;
     }).join("\n");
     return [
+      protocol,
       "[WORMHOLE PIE SESSION CONTEXT - PLAIN TEXT]",
       "This transcript belongs only to the current provider session. Use it for conversational continuity, but do not repeat or re-run earlier actions solely because they appear in history. Only the CURRENT USER REQUEST authorizes new actions.",
       transcript,
@@ -429,7 +448,7 @@ export function buildProviderTaskWithHistory(session: DialogueSession, currentRe
   let task = renderTask();
   while (selected.length && Array.from(task).length > 4_000) {
     selected.shift();
-    task = selected.length ? renderTask() : request;
+    task = selected.length ? renderTask() : `${protocol}\n\n[CURRENT USER REQUEST]\n\n${request}`;
   }
-  return task;
+  return selected.length ? task : `${protocol}\n\n[CURRENT USER REQUEST]\n\n${request}`;
 }

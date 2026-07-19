@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-20
+
+### 新增
+
+- 集成 CC Switch 本机 Provider：只读发现 Claude、Codex 与 Hermes 配置，并可安全应用到对应 Agent。
+- 对话新增“对话、规划、执行、审查”四种会话级模式，各 Agent 的模式与历史彼此隔离。
+
+### 安全与隐私
+
+- CC Switch 原始密钥始终留在 Rust 后端，不返回前端、不写日志，也不修改 CC Switch 数据库当前状态。
+
 ### 改进
 
 - 新增 Windows、macOS 与前端三路持续质量门禁，在合并前执行类型检查、生产构建、Rust 格式、Clippy 和测试。
