@@ -91,6 +91,7 @@ GitHub 仓库的 Actions 页面支持手动运行 `Build Wormhole Pie Installers
 
 - [`.github/workflows/quality.yml`](.github/workflows/quality.yml) 会在 `main` 推送和 Pull Request 上并行执行前端生产构建、Windows Rust 严格检查与 macOS Rust 严格检查。
 - 发布工作流会在生成安装包前重复执行目标平台检查，避免仅在 Windows 本地通过、到 macOS 打包阶段才暴露条件编译错误。
+- Windows 回收站往返测试需要交互式 Explorer 回收站，默认测试集中标记为忽略；在真实 Windows 会话中使用 `cargo test windows_pet_feed_round_trip_uses_the_system_recycle_bin -- --ignored` 单独验收。
 - 浏览器预览用于本地 DOM、状态切换和布局检查，不代表 Windows 原生窗口已经通过验收。
 - Windows 原生 QA 使用 WebView2 CDP 的 `Runtime.evaluate` 检查 `main`、`pet`、`pet-dialogue` DOM，并通过只读 Win32 P/Invoke 检查窗口标题、可见性、矩形、右上角位置、扩展样式、任务栏状态及宠物与对话的相邻关系。
 - 原生 QA 不点击一键整理，不删除文件，也不打开社交网页；每次最终 EXE 构建后仍需重新运行。

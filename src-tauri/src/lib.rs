@@ -953,6 +953,7 @@ fn is_desktop_source_parent(parent: &Path, user_desktop: &Path) -> bool {
         || public_desktop_path().is_some_and(|public| same_path(parent, &public))
 }
 
+#[cfg(any(windows, test))]
 fn elevated_parent_pair_allowed(
     source_parent: &Path,
     destination_parent: &Path,
@@ -2642,6 +2643,7 @@ fn include_public_desktop_requested(value: Option<bool>) -> bool {
     value.unwrap_or(false)
 }
 
+#[cfg(windows)]
 fn public_organize_plan_snapshot(
     plan: &OrganizePlan,
 ) -> Result<(String, BTreeMap<String, DesktopOrganizeIdentity>), String> {
@@ -3180,6 +3182,7 @@ fn collect_programs(
     }
 }
 
+#[cfg(any(windows, test))]
 fn parse_hide_icons_registry_output(output: &[u8]) -> Option<bool> {
     let text = String::from_utf8_lossy(output).to_ascii_lowercase();
     text.split_whitespace().find_map(|part| {
@@ -3282,6 +3285,7 @@ fn set_desktop_icons_hidden(hidden: bool) -> Result<DesktopIconState, String> {
     }
 }
 
+#[cfg(any(windows, test))]
 fn parse_local_speech_output(
     success: bool,
     stdout: &[u8],
@@ -4497,6 +4501,7 @@ fn evaluate_visible_social_metrics(
     serde_json::from_str(value).map_err(|error| error.to_string())
 }
 
+#[cfg(windows)]
 fn save_social_snapshot_to_index(
     index: &SharedIndex,
     snapshot: &SocialAccountSnapshot,
@@ -8708,7 +8713,7 @@ fn install_dependency(kind: AgentConnectorKind) -> Result<bool, String> {
                 }
             ));
         }
-        return Ok(true);
+        Ok(true)
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -10050,21 +10055,28 @@ fn trash_paths_match(left: &Path, right: &Path) -> bool {
     )
 ))]
 fn restore_paths_from_trash(paths: &[PathBuf]) -> Result<(), String> {
-    let trash_items = trash::os_limited::list().map_err(|error| error.to_string())?;
-    let mut selected = Vec::new();
-    for path in paths {
-        if let Some(item) = trash_items
-            .iter()
-            .filter(|item| trash_paths_match(&item.original_path(), path))
-            .max_by_key(|item| item.time_deleted)
-        {
-            selected.push(item.clone());
+    const LIST_RETRY_ATTEMPTS: usize = 20;
+    const LIST_RETRY_DELAY: Duration = Duration::from_millis(100);
+    for attempt in 0..LIST_RETRY_ATTEMPTS {
+        let trash_items = trash::os_limited::list().map_err(|error| error.to_string())?;
+        let mut selected = Vec::new();
+        for path in paths {
+            if let Some(item) = trash_items
+                .iter()
+                .filter(|item| trash_paths_match(&item.original_path(), path))
+                .max_by_key(|item| item.time_deleted)
+            {
+                selected.push(item.clone());
+            }
+        }
+        if selected.len() == paths.len() {
+            return trash::os_limited::restore_all(selected).map_err(|error| error.to_string());
+        }
+        if attempt + 1 < LIST_RETRY_ATTEMPTS {
+            thread::sleep(LIST_RETRY_DELAY);
         }
     }
-    if selected.len() != paths.len() {
-        return Err("回收站中找不到完整的待恢复记录".to_string());
-    }
-    trash::os_limited::restore_all(selected).map_err(|error| error.to_string())
+    Err("???????????????".to_string())
 }
 
 #[cfg(not(any(
@@ -10948,6 +10960,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
+    #[ignore = "requires an interactive Windows Recycle Bin"]
     fn windows_pet_feed_round_trip_uses_the_system_recycle_bin() {
         let workspace = TempWorkspace::new("feed-recycle-round-trip");
         let index = test_index(&workspace);
