@@ -20,6 +20,13 @@ export type DialogueSubmission = {
 };
 export type DialogueCommand = DialogueSubmission & {
   connectorId: DialogueConnectorId;
+  commandId?: string;
+};
+
+export type DialogueCommandAck = {
+  commandId: string;
+  accepted: boolean;
+  error?: string;
 };
 export type AgentConnectorConfigurationState = "ready" | "not_configured" | "permission_blocked" | "probe_failed" | "not_installed";
 
@@ -39,10 +46,13 @@ export type AgentConnectorStatus = {
 export type AgentTaskResult = {
   taskId: string;
   connectorId: AgentConnectorId;
+  appSessionId: string;
   success: boolean;
   timedOut: boolean;
   cancelled: boolean;
   output: string;
+  failureCode?: "authentication" | "quota" | "model_unavailable" | "network" | "session_not_found" | "permission" | "process_launch" | "exit_failure" | null;
+  providerSessionId?: string | null;
   exitCode: number | null;
   durationMs: number;
   truncated: boolean;
@@ -152,6 +162,8 @@ export async function scanDesktopFiles(): Promise<DesktopFile[]> {
 export type DesktopOrganizeResult = {
   movedCount: number;
   newMovedCount?: number;
+  personalMovedCount?: number;
+  publicMovedCount?: number;
   migratedCount?: number;
   categoryCount: number;
   skippedCount: number;
@@ -178,7 +190,10 @@ export type DesktopIconState = {
 export type OrganizeState = {
   canUndo: boolean;
   batchCount: number;
+  latestBatchTouchesPublicDesktop: boolean;
 };
+
+export type PublicDesktopConfirmationAction = "organize" | "review" | "undo";
 
 export type DesktopOrganizeItem = {
   moveId: string;
@@ -216,9 +231,38 @@ function joinWindowsPath(...parts: string[]) {
   return parts.map((part, index) => index ? part.replace(/^[\\/]+|[\\/]+$/g, "") : part.replace(/[\\/]+$/g, "")).join("\\");
 }
 
-export async function organizeDesktop(): Promise<DesktopOrganizeResult> {
+export async function requestPublicDesktopConfirmation(
+  action: PublicDesktopConfirmationAction,
+  batchId?: string,
+  moveIds: string[] = [],
+): Promise<string> {
+  if (!isTauri()) return `browser-public-confirmation-${action}-${Date.now()}`;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("request_public_desktop_confirmation", { action, batchId, moveIds });
+}
+
+export async function organizeDesktop(includePublicDesktop = false, confirmationToken?: string): Promise<DesktopOrganizeResult> {
   if (!isTauri()) {
     const rootPath = "C:\\Users\\你\\Documents\\虫洞派资料库";
+    if (includePublicDesktop) {
+      return {
+        movedCount: 0,
+        newMovedCount: 0,
+        personalMovedCount: 0,
+        publicMovedCount: 0,
+        migratedCount: 0,
+        categoryCount: 0,
+        skippedCount: 2,
+        rootPath,
+        excludedCount: 0,
+        publicDesktopCount: 2,
+        items: [],
+        skippedItems: [
+          { name: "Shared shortcut", path: "C:\\Users\\Public\\Desktop\\Shared shortcut.lnk", reasonCode: "browser_preview", reason: "浏览器预览不会模拟管理员文件移动" },
+          { name: "Shared app", path: "C:\\Users\\Public\\Desktop\\Shared app.lnk", reasonCode: "browser_preview", reason: "浏览器预览不会模拟管理员文件移动" },
+        ],
+      };
+    }
     const exclusionKeys = new Set(browserExclusions.map((item) => item.nameKey));
     const candidates = browserDesktopFiles.filter((file) => !exclusionKeys.has(file.name.trim().toLocaleLowerCase()));
     const excludedCount = browserDesktopFiles.length - candidates.length;
@@ -253,6 +297,8 @@ export async function organizeDesktop(): Promise<DesktopOrganizeResult> {
     return {
       movedCount: items.length,
       newMovedCount: items.length,
+      personalMovedCount: items.length,
+      publicMovedCount: 0,
       migratedCount: 0,
       categoryCount: new Set(items.map((item) => item.category)).size,
       skippedCount: 0,
@@ -264,10 +310,10 @@ export async function organizeDesktop(): Promise<DesktopOrganizeResult> {
     };
   }
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<DesktopOrganizeResult>("organize_desktop");
+  return invoke<DesktopOrganizeResult>("organize_desktop", { includePublicDesktop, confirmationToken });
 }
 
-export async function reviewDesktopOrganize(batchId: string, excludedMoveIds: string[]): Promise<DesktopOrganizeReviewResult> {
+export async function reviewDesktopOrganize(batchId: string, excludedMoveIds: string[], confirmationToken?: string): Promise<DesktopOrganizeReviewResult> {
   if (!isTauri()) {
     const batchIndex = browserBatches.findIndex((batch) => batch.batchId === batchId);
     if (batchIndex < 0) throw new Error("浏览器预览中的整理批次已失效");
@@ -307,10 +353,10 @@ export async function reviewDesktopOrganize(batchId: string, excludedMoveIds: st
     };
   }
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<DesktopOrganizeReviewResult>("review_desktop_organize", { batchId, excludedMoveIds });
+  return invoke<DesktopOrganizeReviewResult>("review_desktop_organize", { batchId, excludedMoveIds, confirmationToken });
 }
 
-export async function undoDesktopOrganize(): Promise<DesktopOrganizeResult> {
+export async function undoDesktopOrganize(confirmationToken?: string): Promise<DesktopOrganizeResult> {
   if (!isTauri()) {
     const batch = browserBatches.pop();
     if (!batch) return { movedCount: 0, categoryCount: 0, skippedCount: 0, rootPath: "Documents\\虫洞派资料库", items: [] };
@@ -331,12 +377,12 @@ export async function undoDesktopOrganize(): Promise<DesktopOrganizeResult> {
     };
   }
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<DesktopOrganizeResult>("undo_desktop_organize");
+  return invoke<DesktopOrganizeResult>("undo_desktop_organize", { confirmationToken });
 }
 
 export async function getOrganizeState(): Promise<OrganizeState> {
   if (!isTauri()) {
-    return { canUndo: browserBatches.length > 0, batchCount: browserBatches.length };
+    return { canUndo: browserBatches.length > 0, batchCount: browserBatches.length, latestBatchTouchesPublicDesktop: false };
   }
   return invokeWhenStateReady<OrganizeState>("get_organize_state");
 }
@@ -381,9 +427,91 @@ export async function openSocialPage(platform: "xiaohongshu" | "x" | "douyin"): 
   await invoke("open_social", { platform });
 }
 
+export type SocialPlatform = "xiaohongshu" | "x" | "douyin";
+export type SocialMetricSource = "visible-page" | "manual" | "unavailable";
+
+export type SocialAccountSnapshot = {
+  platform: SocialPlatform;
+  displayName: string;
+  followers: number;
+  unreadMessages: number;
+  unreadNotifications: number;
+  followersSource?: SocialMetricSource;
+  unreadMessagesSource?: SocialMetricSource;
+  unreadNotificationsSource?: SocialMetricSource;
+  accountIdentity?: string;
+  connected: boolean;
+  updatedAt: number;
+  sessionPersistence?: "edge-profile";
+  rawCookieAccessed?: false;
+};
+
+export async function openSocialSession(platform: SocialPlatform): Promise<void> {
+  if (!isTauri()) {
+    const urls = { xiaohongshu: "https://creator.xiaohongshu.com/", x: "https://x.com/home", douyin: "https://creator.douyin.com/" } as const;
+    window.open(urls[platform], "_blank", "noopener,noreferrer");
+    return;
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_social_session", { platform });
+}
+
+export async function listSocialAccounts(): Promise<SocialAccountSnapshot[]> {
+  if (!isTauri()) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<SocialAccountSnapshot[]>("list_social_accounts");
+}
+
+export async function saveSocialSnapshot(snapshot: SocialAccountSnapshot): Promise<SocialAccountSnapshot> {
+  if (!isTauri()) return { ...snapshot, updatedAt: Math.floor(Date.now() / 1000) };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<SocialAccountSnapshot>("save_social_snapshot", { snapshot });
+}
+
+export async function syncSocialSnapshot(platform: SocialPlatform): Promise<SocialAccountSnapshot> {
+  if (!isTauri()) throw new Error("浏览器预览无法读取托管登录会话");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<SocialAccountSnapshot>("sync_social_snapshot", { platform });
+}
+
+export async function disconnectSocialSession(platform: SocialPlatform): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("disconnect_social_session", { platform });
+}
+
+export async function clearSocialSession(platform: SocialPlatform): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("clear_social_session", { platform });
+}
+
+const sensitiveUrlQueryName = (name: string) => {
+  const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return new Set([
+    "token", "accesstoken", "refreshtoken", "idtoken", "authorization", "auth", "apikey",
+    "password", "passwd", "secret", "clientsecret", "credential", "credentials", "cookie",
+    "session", "sessionid", "jwt", "signature", "sig", "code", "state",
+  ]).has(normalized);
+};
+
+export const sanitizeExternalUrl = (url: string) => {
+  const value = url.trim();
+  if (!value || value.length > 2048 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error("链接为空、过长或包含控制字符");
+  }
+  const parsed = new URL(value);
+  if (parsed.protocol !== "https:" || !parsed.hostname) throw new Error("只支持有效的 HTTPS 链接");
+  if (parsed.username || parsed.password) throw new Error("链接不能包含用户名或密码");
+  for (const name of Array.from(parsed.searchParams.keys())) {
+    if (sensitiveUrlQueryName(name)) parsed.searchParams.delete(name);
+  }
+  parsed.hash = "";
+  return parsed;
+};
+
 export async function openExternalUrl(url: string): Promise<void> {
-  const parsed = new URL(url);
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("只支持 http 或 https 链接");
+  const parsed = sanitizeExternalUrl(url);
   if (!isTauri()) {
     window.open(parsed.toString(), "_blank", "noopener,noreferrer");
     return;
@@ -516,16 +644,25 @@ export async function runAgentTask(
   task: string,
   workspace: string,
   attachmentPaths: string[] = [],
+  appSessionId: string,
+  providerSessionId?: string | null,
 ): Promise<AgentTaskResult> {
   if (!isTauri()) throw new Error("浏览器预览无法运行本机 Agent 任务，请在虫洞派桌面应用中使用。");
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<AgentTaskResult>("run_agent_task", { connectorId, task, workspace, attachmentPaths });
+  return invoke<AgentTaskResult>("run_agent_task", {
+    connectorId,
+    task,
+    workspace,
+    attachmentPaths,
+    appSessionId,
+    providerSessionId: providerSessionId || null,
+  });
 }
 
-export async function pickDialogueFiles(): Promise<string[]> {
+export async function pickDialogueFiles(locale = document.documentElement.lang): Promise<string[]> {
   if (!isTauri()) return [];
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<string[]>("pick_dialogue_files");
+  return invoke<string[]>("pick_dialogue_files", { locale });
 }
 
 export async function openAgentResultFile(path: string, workspace: string): Promise<void> {
@@ -600,7 +737,22 @@ export type DialogueState = {
   busy?: boolean;
   connectorId?: DialogueConnectorId;
   resultFiles?: AgentResultFile[];
+  sessions?: import("../dialogueSessions").DialogueSessions;
 };
+
+export async function setAppLocale(locale: "zh-CN" | "en-US"): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("set_app_locale", { locale });
+}
+
+export async function subscribeToAppLocale(onLocale: (locale: "zh-CN" | "en-US") => void) {
+  if (!isTauri()) return () => undefined;
+  const { listen } = await import("@tauri-apps/api/event");
+  return listen<string>("locale://changed", (event) => {
+    if (event.payload === "zh-CN" || event.payload === "en-US") onLocale(event.payload);
+  });
+}
 
 export type PetRuntimeAnimationEndEvent = {
   actionInstanceId: string;
@@ -624,17 +776,49 @@ export async function hidePetDialogue(): Promise<void> {
 }
 
 export async function sendDialogueCommand(command: DialogueCommand): Promise<void> {
+  const commandId = command.commandId ?? (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+    ? crypto.randomUUID()
+    : `dialogue-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const payload = {
     text: command.text,
     connectorId: command.connectorId,
     attachmentPaths: command.attachmentPaths ?? [],
+    commandId,
   };
   if (!isTauri()) {
     window.dispatchEvent(new CustomEvent("wormhole:dialogue-command", { detail: payload }));
     return;
   }
+  const { emit, listen } = await import("@tauri-apps/api/event");
+  await new Promise<void>(async (resolve, reject) => {
+    let settled = false;
+    let timeout = 0;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      unlisten?.();
+      if (error) reject(error);
+      else resolve();
+    };
+    let unlisten: undefined | (() => void);
+    try {
+      unlisten = await listen<DialogueCommandAck>("dialogue://command-ack", (event) => {
+        if (event.payload.commandId !== commandId) return;
+        finish(event.payload.accepted ? undefined : new Error(event.payload.error || "主窗口没有接收这条消息"));
+      });
+      timeout = window.setTimeout(() => finish(new Error("主窗口暂时没有响应，请重新打开主窗口后再试")), 4_000);
+      await emit("dialogue://command", payload);
+    } catch (error) {
+      finish(error instanceof Error ? error : new Error(String(error)));
+    }
+  });
+}
+
+export async function acknowledgeDialogueCommand(ack: DialogueCommandAck): Promise<void> {
+  if (!isTauri()) return;
   const { emit } = await import("@tauri-apps/api/event");
-  await emit("dialogue://command", payload);
+  await emit("dialogue://command-ack", ack);
 }
 
 export async function publishDialogueState(state: DialogueState): Promise<void> {
@@ -651,6 +835,7 @@ export async function subscribeToDialogueCommand(onCommand: (command: DialogueCo
         text: detail.text,
         connectorId: detail.connectorId ?? "local",
         attachmentPaths: Array.isArray(detail.attachmentPaths) ? detail.attachmentPaths : [],
+        commandId: typeof detail.commandId === "string" ? detail.commandId : undefined,
       });
     };
     window.addEventListener("wormhole:dialogue-command", listener);
@@ -661,6 +846,7 @@ export async function subscribeToDialogueCommand(onCommand: (command: DialogueCo
     text: event.payload.text,
     connectorId: event.payload.connectorId ?? "local",
     attachmentPaths: Array.isArray(event.payload.attachmentPaths) ? event.payload.attachmentPaths : [],
+    commandId: typeof event.payload.commandId === "string" ? event.payload.commandId : undefined,
   }));
 }
 

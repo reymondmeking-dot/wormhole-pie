@@ -44,6 +44,7 @@ import {
   Tag,
   Trash2,
   Undo2,
+  Unplug,
   Volume2,
   Video,
   X,
@@ -71,7 +72,20 @@ import type { WindowMotion } from "./components/WormholeTransition";
 import { mockFiles, seedIdeas, seedNotices, seedTodos } from "./data/mockData";
 import { usePersistentState } from "./hooks/usePersistentState";
 import { useDocumentLanguage, type AppLocale } from "./i18n";
-import { PetSprite } from "./pet/PetSprite";
+import {
+  appendDialogueAssistantMessage,
+  appendDialogueUserMessage,
+  buildProviderTaskWithHistory,
+  createDialogueSessions,
+  dialogueSessionStorageKey,
+  mergeDialogueSessions,
+  normalizeDialogueSessions,
+  setDialogueSessionPreview,
+  updateDialogueSessionFields,
+  type DialogueSession,
+  type DialogueSessions,
+} from "./dialogueSessions";
+import { getBlenderPetPreviewSrc, PetSprite } from "./pet/PetSprite";
 import type { PetAnimationLoopBoundaryEvent } from "./pet/PetSprite";
 import { getPetAssetId, getPetFrameSrc, loadPetManifests } from "./pet/petManifest";
 import type { PetSpriteAction } from "./pet/petManifest";
@@ -88,6 +102,8 @@ import {
   isTauri,
   enterRestMode,
   exitRestMode,
+  clearSocialSession,
+  disconnectSocialSession,
   feedFilesToPet,
   getAgentDefaultWorkspace,
   getAgentTaskResult,
@@ -103,22 +119,30 @@ import {
   listDesktopFiles,
   listOrganizeExclusions,
   listPrograms,
+  listSocialAccounts,
   organizeDesktop,
   openAgentResultFile,
   openDesktopFile,
   openExternalUrl,
   openSocialPage,
+  openSocialSession,
   quitApp,
   recognizeLocalSpeech,
   removeOrganizeExclusion,
+  requestPublicDesktopConfirmation,
   reviewDesktopOrganize,
   restoreLibraryItemsToDesktop,
   runAgentTask,
+  sanitizeExternalUrl,
+  saveSocialSnapshot,
   scanDesktopFiles,
+  acknowledgeDialogueCommand,
   sendDialogueCommand,
   setPetLayer,
   setPetVisibility,
   setDesktopIconsHidden,
+  setAppLocale,
+  syncSocialSnapshot,
   setWindowLogicalPosition,
   showMainFromTray,
   showPetContextMenu,
@@ -128,6 +152,7 @@ import {
   subscribeToAgentTaskResult,
   subscribeToAgentTaskStatus,
   subscribeToFileChanges,
+  subscribeToAppLocale,
   subscribeToDialogueCommand,
   subscribeToDialogueState,
   subscribeToExitRestRequest,
@@ -156,23 +181,27 @@ import {
   subscribeToPetRuntimeState,
   subscribeToPetRuntimeStateRequests,
 } from "./lib/desktop";
-import type { AgentConnectorStatus, AgentResultFile, AgentTaskResult, AgentTaskStatus, DesktopIconState, DesktopOrganizeResult, DesktopOrganizeReviewResult, DialogueCommand, DialogueConnectorId, DialogueState, DialogueSubmission, PetFeedResult, PetLayer } from "./lib/desktop";
+import type { AgentConnectorId, AgentConnectorStatus, AgentResultFile, AgentTaskResult, AgentTaskStatus, DesktopIconState, DesktopOrganizeResult, DesktopOrganizeReviewResult, DialogueCommand, DialogueConnectorId, DialogueState, DialogueSubmission, PetFeedResult, PetLayer, SocialAccountSnapshot, SocialPlatform } from "./lib/desktop";
 import { relativeTime } from "./lib/format";
 import {
   evolutionBadges,
   evolutionPathOptions,
+  evolutionStageOptions,
+  calculatePetEvolution,
+  defaultPetEvolutionMetrics,
+  mergePetEvolutionMetrics,
   petClassName,
   petMotionOptions,
   petSpeciesOptions,
   petStorageKeys,
   petThemeOptions,
 } from "./petProfile";
-import type { EvolutionPath, PetMotionMode, PetSpecies, PetTheme } from "./petProfile";
+import type { EvolutionPath, EvolutionStage, PetEvolutionMetrics, PetMotionMode, PetSpecies, PetTheme } from "./petProfile";
 import type { DesktopFile, FavoriteProgram, Idea, Notice, OrganizedCategory, OrganizeExclusion, ProgramEntry, Todo } from "./types";
 
 type WidgetTab = "home" | "files" | "todos" | "ideas";
 type FileFilter = OrganizedCategory | "all" | "unorganized";
-type Platform = "xiaohongshu" | "x" | "douyin";
+type Platform = SocialPlatform;
 type LegacyPetAction = "idle" | "blink" | "wave" | "stretch" | "peek" | "hungry" | "eat" | "happy" | "error";
 type PetAction = LegacyPetAction | PetSpriteAction;
 type CursorPoint = { x: number; y: number };
@@ -528,6 +557,7 @@ function levenshteinSimilarity(left: string, right: string) {
 
 function rankFiles(files: DesktopFile[], keyword: string) {
   const normalizedKeyword = keyword.toLowerCase().replace(/\s+/g, "");
+  if (!normalizedKeyword) return [];
   return files
     .map((file) => {
       const normalizedName = file.name.toLowerCase().replace(/\s+/g, "");
@@ -544,6 +574,7 @@ function rankFiles(files: DesktopFile[], keyword: string) {
 
 function rankPrograms(programs: ProgramEntry[], keyword: string) {
   const normalizedKeyword = keyword.toLowerCase().replace(/\s+/g, "");
+  if (!normalizedKeyword) return [];
   return programs
     .map((program) => {
       const normalizedName = program.name.toLowerCase().replace(/\s+/g, "");
@@ -633,6 +664,7 @@ type PetProps = {
   species: PetSpecies;
   theme: PetTheme;
   evolution: EvolutionPath;
+  evolutionStage: EvolutionStage;
   motionMode: PetMotionMode;
   message: string;
   pendingCount: number;
@@ -645,7 +677,7 @@ type PetProps = {
   onPetSignal: () => void;
 };
 
-function PetSummary({ name, species, theme, evolution, motionMode, message, pendingCount, isListening, dialogueEnabled, cursor, action, runtime, onChat, onPetSignal }: PetProps) {
+function PetSummary({ name, species, theme, evolution, evolutionStage, motionMode, message, pendingCount, isListening, dialogueEnabled, cursor, action, runtime, onChat, onPetSignal }: PetProps) {
   const buttonRef = useRef<HTMLButtonElement>(null);
   const bounds = buttonRef.current?.getBoundingClientRect();
   const centerX = bounds ? bounds.left + bounds.width / 2 : 0;
@@ -669,6 +701,8 @@ function PetSummary({ name, species, theme, evolution, motionMode, message, pend
         <PetSprite
           species={species}
           action={effectiveAction}
+          evolutionStage={evolutionStage}
+          evolutionPath={evolution}
           motionMode={runtime?.behaviorMode ?? motionMode}
           className="pet-sprite--summary"
           lookX={look.x}
@@ -683,7 +717,7 @@ function PetSummary({ name, species, theme, evolution, motionMode, message, pend
       </button>
       <div className="pet-bubble">
         <strong>{message || `今天还有 ${pendingCount} 件事`}</strong>
-        <span>{dialogueEnabled ? `点一下，和${name}说句话` : "对话已关闭，点我设置"}</span>
+        <span>{dialogueEnabled ? <>点一下，和<span data-no-i18n>{name}</span>说句话</> : "对话已关闭，点我设置"}</span>
       </div>
     </section>
   );
@@ -712,7 +746,7 @@ function TodayCard({ todos, onToggle, onOpenAll, onAction }: TodayCardProps) {
               <button className="compact-check" onClick={() => onToggle(todo.id)} aria-label={`完成 ${todo.title}`}>
                 <Circle size={17} />
               </button>
-              <button className="compact-todo-title" onClick={() => actionableTodo.actionType && onAction(actionableTodo)}>
+              <button className="compact-todo-title" data-no-i18n onClick={() => actionableTodo.actionType && onAction(actionableTodo)}>
                 {todo.title}
               </button>
               <time>{todo.time}</time>
@@ -802,7 +836,7 @@ function RecentFilesCard({
             {files.slice(0, 3).map((file) => (
               <button className="recent-file" key={file.id} onClick={() => onOpen(file)}>
                 <FileTypeIcon file={file} />
-                <span className="recent-file-name">{file.name}</span>
+                <span className="recent-file-name" data-no-i18n>{file.name}</span>
                 {file.isNew ? <i className="new-file-dot" /> : null}
                 <time>{relativeTime(file.modifiedAt)}</time>
                 <ExternalLink size={13} />
@@ -816,7 +850,7 @@ function RecentFilesCard({
               <article className="recent-file recent-program" key={program.path}>
                 <button className="recent-program-open" onClick={() => onLaunchProgram(program)}>
                   <span className="widget-file-icon kind-application"><AppWindow size={16} strokeWidth={1.9} /></span>
-                  <span className="recent-file-name">{program.name}</span>
+                  <span className="recent-file-name" data-no-i18n>{program.name}</span>
                   <time>{program.source === "favorite" ? "自定义" : "系统"}</time>
                   <ExternalLink size={13} />
                 </button>
@@ -1125,7 +1159,7 @@ function FilesView({ files, programs, programsLoading, arrangeMode, query, filte
                   <article className="full-file-row" key={file.id} onContextMenu={(event) => openFileMenu(event, file)}>
                     <button className="full-file-open" onClick={() => onOpen(file)}>
                       <FileTypeIcon file={file} size={17} />
-                      <span><strong>{file.name}</strong><small><em>{item.category}</em>{isOrganizedFile(file) ? "已整理" : "桌面"} · {timeLabel}</small></span>
+                      <span><strong data-no-i18n>{file.name}</strong><small><em>{item.category}</em>{isOrganizedFile(file) ? "已整理" : "桌面"} · {timeLabel}</small></span>
                     </button>
                     <label className="compact-category">
                       <select value={currentTag} onChange={(event) => onCategory(file.id, event.target.value)} aria-label={`${file.name} 分类`}>
@@ -1185,7 +1219,7 @@ function TodosView({ todos, onBack, onAdd, onToggle, onAction }: TodosViewProps)
           return (
             <article className={`full-todo-row ${todo.status === "done" ? "is-complete" : ""}`} key={todo.id}>
               <button className="full-todo-check" onClick={() => onToggle(todo.id)}>{todo.status === "done" ? <Check size={14} /> : <Circle size={17} />}</button>
-              <button className="full-todo-copy" onClick={() => actionableTodo.actionType && onAction(actionableTodo)}><strong>{todo.title}</strong><span>{(todo.date ?? today) === today ? todo.time : todo.date} · {todo.status === "doing" ? "进行中" : todo.status === "done" ? "已完成" : "待开始"}</span></button>
+              <button className="full-todo-copy" onClick={() => actionableTodo.actionType && onAction(actionableTodo)}><strong data-no-i18n>{todo.title}</strong><span>{(todo.date ?? today) === today ? todo.time : todo.date} · {todo.status === "doing" ? "进行中" : todo.status === "done" ? "已完成" : "待开始"}</span></button>
               {actionableTodo.actionType ? <button className="row-link" onClick={() => onAction(actionableTodo)}><ExternalLink size={14} /></button> : null}
             </article>
           );
@@ -1243,23 +1277,147 @@ function NotificationSheet({ notices, onClose, onReadAll }: { notices: Notice[];
 
 function normalizeCustomSocialUrl(value: string) {
   const candidate = /^https?:\/\//i.test(value.trim()) ? value.trim() : `https://${value.trim()}`;
-  const parsed = new URL(candidate);
-  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("只支持 http 或 https 链接");
-  return parsed.toString();
+  return sanitizeExternalUrl(candidate).toString();
 }
 
 type SocialSettingsProps = {
   shortcuts: CustomSocialShortcut[];
+  accounts: SocialAccountSnapshot[];
+  loading: boolean;
   onAdd: (name: string, url: string) => void;
   onRemove: (id: string) => void;
   onOpen: (shortcut: CustomSocialShortcut) => void;
+  onConnect: (platform: SocialPlatform) => Promise<void>;
+  onSyncSnapshot: (platform: SocialPlatform) => Promise<SocialAccountSnapshot>;
+  onSaveSnapshot: (snapshot: SocialAccountSnapshot) => Promise<void>;
+  onDisconnect: (platform: SocialPlatform) => Promise<void>;
+  onClear: (platform: SocialPlatform) => Promise<void>;
   onClose: () => void;
 };
 
-function SocialSettingsSheet({ shortcuts, onAdd, onRemove, onOpen, onClose }: SocialSettingsProps) {
+const socialPlatforms: Array<{ id: SocialPlatform; label: string; mark: string }> = [
+  { id: "xiaohongshu", label: "小红书", mark: "红" },
+  { id: "x", label: "X", mark: "X" },
+  { id: "douyin", label: "抖音", mark: "抖" },
+];
+
+const emptySocialSnapshot = (platform: SocialPlatform): SocialAccountSnapshot => ({
+  platform,
+  displayName: "",
+  followers: 0,
+  unreadMessages: 0,
+  unreadNotifications: 0,
+  followersSource: "unavailable",
+  unreadMessagesSource: "unavailable",
+  unreadNotificationsSource: "unavailable",
+  accountIdentity: "",
+  connected: false,
+  updatedAt: 0,
+  sessionPersistence: "edge-profile",
+  rawCookieAccessed: false,
+});
+
+function normalizeSocialMetricInput(value: string) {
+  if (!value.trim()) return { value: 0, source: "unavailable" as const };
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return null;
+  return { value: parsed, source: "manual" as const };
+}
+
+function SocialSettingsSheet({ shortcuts, accounts, loading, onAdd, onRemove, onOpen, onConnect, onSyncSnapshot, onSaveSnapshot, onDisconnect, onClear, onClose }: SocialSettingsProps) {
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
+  const [drafts, setDrafts] = useState<Record<SocialPlatform, SocialAccountSnapshot>>(() => Object.fromEntries(
+    socialPlatforms.map(({ id }) => [id, accounts.find((account) => account.platform === id) ?? emptySocialSnapshot(id)]),
+  ) as Record<SocialPlatform, SocialAccountSnapshot>);
+  const [busyPlatform, setBusyPlatform] = useState<SocialPlatform | null>(null);
+  const [confirmClearPlatform, setConfirmClearPlatform] = useState<SocialPlatform | null>(null);
+
+  useEffect(() => {
+    setDrafts(Object.fromEntries(socialPlatforms.map(({ id }) => [
+      id,
+      accounts.find((account) => account.platform === id) ?? emptySocialSnapshot(id),
+    ])) as Record<SocialPlatform, SocialAccountSnapshot>);
+  }, [accounts]);
+
+  useEffect(() => {
+    if (!confirmClearPlatform) return;
+    const timer = window.setTimeout(() => setConfirmClearPlatform(null), 4_000);
+    return () => window.clearTimeout(timer);
+  }, [confirmClearPlatform]);
+
+  const updateDraft = (platform: SocialPlatform, patch: Partial<SocialAccountSnapshot>) => {
+    setDrafts((current) => ({ ...current, [platform]: { ...current[platform], ...patch } }));
+  };
+
+  const connect = async (platform: SocialPlatform) => {
+    setBusyPlatform(platform);
+    setError("");
+    try {
+      await onConnect(platform);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "托管浏览器会话没有打开");
+    } finally {
+      setBusyPlatform(null);
+    }
+  };
+
+  const saveSnapshot = async (platform: SocialPlatform) => {
+    setBusyPlatform(platform);
+    setError("");
+    try {
+      await onSaveSnapshot(drafts[platform]);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "汇总数据没有保存");
+    } finally {
+      setBusyPlatform(null);
+    }
+  };
+
+  const syncSnapshot = async (platform: SocialPlatform) => {
+    setBusyPlatform(platform);
+    setError("");
+    try {
+      const snapshot = await onSyncSnapshot(platform);
+      updateDraft(platform, snapshot);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "没有读取到当前页面的可见汇总数据");
+    } finally {
+      setBusyPlatform(null);
+    }
+  };
+
+  const disconnect = async (platform: SocialPlatform) => {
+    setBusyPlatform(platform);
+    setError("");
+    try {
+      await onDisconnect(platform);
+      updateDraft(platform, { connected: false });
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "托管浏览器会话没有断开");
+    } finally {
+      setBusyPlatform(null);
+    }
+  };
+
+  const clear = async (platform: SocialPlatform) => {
+    if (confirmClearPlatform !== platform) {
+      setConfirmClearPlatform(platform);
+      return;
+    }
+    setBusyPlatform(platform);
+    setError("");
+    try {
+      await onClear(platform);
+      updateDraft(platform, emptySocialSnapshot(platform));
+      setConfirmClearPlatform(null);
+    } catch (nextError) {
+      setError(nextError instanceof Error ? nextError.message : "登录资料没有清除");
+    } finally {
+      setBusyPlatform(null);
+    }
+  };
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
@@ -1286,8 +1444,35 @@ function SocialSettingsSheet({ shortcuts, onAdd, onRemove, onOpen, onClose }: So
   return (
     <div className="sheet-scrim" onMouseDown={onClose}>
       <section className="social-settings-sheet" onMouseDown={(event) => event.stopPropagation()} aria-label="社交媒体快捷入口设置">
-        <div className="sheet-heading"><div><Plus size={18} /><h2>添加社交媒体</h2></div><button onClick={onClose} aria-label="关闭社交媒体设置"><X size={17} /></button></div>
-        <p>添加常用创作中心或主页，登录状态继续由系统浏览器保留。</p>
+        <div className="sheet-heading"><div><Link2 size={18} /><h2>社交账号中心</h2></div><button onClick={onClose} aria-label="关闭社交媒体设置"><X size={17} /></button></div>
+        <p>每个平台使用独立的 Edge Profile 保持登录；登录态由 Edge 自己保存，应用不会提取、导出或复制原始 Cookie。</p>
+        <p className="social-security-note">连接后请先在 Edge 完成登录，再点“同步并验证”。仅读取当前账号页面可见的名称和汇总数字，不读取私信正文。</p>
+        <div className="social-account-grid" aria-busy={loading}>
+          {socialPlatforms.map((platform) => {
+            const snapshot = drafts[platform.id];
+            const busy = loading || busyPlatform === platform.id;
+            return (
+              <article className="social-account-card" key={platform.id}>
+                <div className="social-account-heading"><i>{platform.mark}</i><span><strong>{platform.label}</strong><small>{snapshot.connected ? `账号已验证${snapshot.displayName ? ` · ${snapshot.displayName}` : ""}` : "登录状态尚未验证"}</small></span></div>
+                <label><span>账号名称</span><input value={snapshot.displayName} maxLength={64} placeholder="可选" onChange={(event) => updateDraft(platform.id, { displayName: event.target.value })} /></label>
+                <div className="social-metric-row">
+                  <label><span>粉丝</span><input type="number" min="0" step="1" value={snapshot.followersSource === "unavailable" ? "" : snapshot.followers} placeholder="未读取到" onChange={(event) => { const metric = normalizeSocialMetricInput(event.target.value); if (metric) updateDraft(platform.id, { followers: metric.value, followersSource: metric.source }); }} /><small>{snapshot.followersSource === "visible-page" ? "页面可见" : snapshot.followersSource === "manual" ? "手动值" : "未读取到"}</small></label>
+                  <label><span>未读私信</span><input type="number" min="0" step="1" value={snapshot.unreadMessagesSource === "unavailable" ? "" : snapshot.unreadMessages} placeholder="未读取到" onChange={(event) => { const metric = normalizeSocialMetricInput(event.target.value); if (metric) updateDraft(platform.id, { unreadMessages: metric.value, unreadMessagesSource: metric.source }); }} /><small>{snapshot.unreadMessagesSource === "visible-page" ? "页面可见" : snapshot.unreadMessagesSource === "manual" ? "手动值" : "未读取到"}</small></label>
+                  <label><span>通知</span><input type="number" min="0" step="1" value={snapshot.unreadNotificationsSource === "unavailable" ? "" : snapshot.unreadNotifications} placeholder="未读取到" onChange={(event) => { const metric = normalizeSocialMetricInput(event.target.value); if (metric) updateDraft(platform.id, { unreadNotifications: metric.value, unreadNotificationsSource: metric.source }); }} /><small>{snapshot.unreadNotificationsSource === "visible-page" ? "页面可见" : snapshot.unreadNotificationsSource === "manual" ? "手动值" : "未读取到"}</small></label>
+                </div>
+                <div className="social-account-actions">
+                  <button type="button" onClick={() => void connect(platform.id)} disabled={busy}><ExternalLink size={12} />打开登录窗口</button>
+                  <button type="button" onClick={() => void syncSnapshot(platform.id)} disabled={busy}><RefreshCw size={12} className={busyPlatform === platform.id ? "is-spinning" : ""} />{busyPlatform === platform.id ? "同步中…" : "同步并验证"}</button>
+                  <button type="button" onClick={() => void saveSnapshot(platform.id)} disabled={busy}><Check size={12} />保存汇总</button>
+                  <button type="button" onClick={() => void disconnect(platform.id)} disabled={busy}><Unplug size={12} />断开窗口</button>
+                  <button type="button" className={confirmClearPlatform === platform.id ? "is-danger" : ""} onClick={() => void clear(platform.id)} disabled={busy}><Trash2 size={12} />{confirmClearPlatform === platform.id ? "确认清除登录资料" : "清除登录资料"}</button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+        <p className="social-security-note">没有官方 API 授权时，可同步托管页面上可见的汇总数字，也可手动修正后保存。</p>
+        <h3 className="social-custom-heading">自定义快捷入口</h3>
         <form className="social-add-form" onSubmit={submit}>
           <label><span>名称</span><input value={name} onChange={(event) => setName(event.target.value)} maxLength={12} placeholder="例如：微信公众平台" /></label>
           <label><span>主页链接</span><input value={url} onChange={(event) => setUrl(event.target.value)} maxLength={2048} placeholder="mp.weixin.qq.com" /></label>
@@ -1362,6 +1547,12 @@ type PetSettingsProps = {
   species: PetSpecies;
   theme: PetTheme;
   evolution: EvolutionPath;
+  autoEvolution: boolean;
+  manualEvolutionStage: EvolutionStage;
+  evolutionStage: EvolutionStage;
+  evolutionPoints: number;
+  evolutionStagePoints: number;
+  evolutionStageSpan: number;
   motionMode: PetMotionMode;
   visible: boolean;
   layer: PetLayer;
@@ -1378,6 +1569,8 @@ type PetSettingsProps = {
   onSpecies: (value: PetSpecies) => void;
   onTheme: (value: PetTheme) => void;
   onEvolution: (value: EvolutionPath) => void;
+  onEvolutionStage: (value: EvolutionStage) => void;
+  onAutoEvolution: (value: boolean) => void;
   onMotionMode: (value: PetMotionMode) => void;
   onVisible: (value: boolean) => void;
   onLayer: (value: PetLayer) => void;
@@ -1397,6 +1590,12 @@ function PetSettingsSheet({
   species,
   theme,
   evolution,
+  autoEvolution,
+  manualEvolutionStage,
+  evolutionStage,
+  evolutionPoints,
+  evolutionStagePoints,
+  evolutionStageSpan,
   motionMode,
   visible,
   layer,
@@ -1413,6 +1612,8 @@ function PetSettingsSheet({
   onSpecies,
   onTheme,
   onEvolution,
+  onEvolutionStage,
+  onAutoEvolution,
   onMotionMode,
   onVisible,
   onLayer,
@@ -1473,11 +1674,38 @@ function PetSettingsSheet({
         </div>
 
         <div className="pet-custom-block">
-          <label><Sprout size={15} />进化路线</label>
+          <div className="evolution-heading">
+            <label><Sprout size={15} />进化路线</label>
+            <button className={`widget-switch ${autoEvolution ? "is-on" : ""}`} onClick={() => onAutoEvolution(!autoEvolution)} aria-label="切换自动进化" aria-pressed={autoEvolution}><i /></button>
+          </div>
+          <div className="evolution-progress">
+            <img src={getBlenderPetPreviewSrc(species, evolutionStage, evolution)} alt="Blender 3D 渲染的进化外观" />
+            <span>
+              <strong>{autoEvolution ? "指标自动进化" : "手动选择路线与阶段"}</strong>
+              <small>
+                {evolutionStage === "seedling" ? "幼苗阶段" : evolutionStage === "growing" ? "成长阶段" : "进化完成"}
+                {autoEvolution ? ` · 总计 ${evolutionPoints} 点` : " · 手动外观"}
+              </small>
+            </span>
+            <progress max={autoEvolution ? evolutionStageSpan : 1} value={autoEvolution ? evolutionStagePoints : 1} />
+          </div>
           <div className="evolution-options">
             {evolutionPathOptions.map((option) => (
-              <button key={option.value} aria-pressed={evolution === option.value} className={evolution === option.value ? "is-active" : ""} onClick={() => onEvolution(option.value)}>
+              <button key={option.value} disabled={autoEvolution} aria-pressed={evolution === option.value} className={evolution === option.value ? "is-active" : ""} onClick={() => onEvolution(option.value)}>
                 <i>{evolutionBadges[option.value]}</i><span><strong>{option.label}</strong><small>{option.detail}</small></span>
+              </button>
+            ))}
+          </div>
+          <div className="evolution-stage-options" aria-label="进化阶段">
+            {evolutionStageOptions.map((option) => (
+              <button
+                key={option.value}
+                disabled={autoEvolution}
+                aria-pressed={manualEvolutionStage === option.value}
+                className={manualEvolutionStage === option.value ? "is-active" : ""}
+                onClick={() => onEvolutionStage(option.value)}
+              >
+                <strong>{option.label}</strong><small>{option.detail}</small>
               </button>
             ))}
           </div>
@@ -1556,7 +1784,7 @@ function PetSettingsSheet({
         </div>
         {lastFeed ? (
           <div className="last-feed-row">
-            <span><Archive size={16} /><strong>刚吃掉 {lastFeed.count} 个项目</strong><small>{lastFeed.warning || lastFeed.names.slice(0, 2).join("、")}</small></span>
+            <span><Archive size={16} /><strong>{`刚吃掉 ${lastFeed.count} 个项目`}</strong><small>{lastFeed.warning || lastFeed.names.slice(0, 2).join("、")}</small></span>
             <button onClick={onUndoFeed}>撤销</button>
           </div>
         ) : null}
@@ -1574,19 +1802,28 @@ type OrganizeSheetProps = {
   organizedTotal: number;
   desktopIconState: DesktopIconState;
   onClose: () => void;
-  onUndo: () => void;
-  onReview: (excludedMoveIds: string[], favoriteMoveIds: string[]) => Promise<DesktopOrganizeReviewResult>;
+  onUndo: (confirmationToken?: string) => void;
+  onReview: (excludedMoveIds: string[], favoriteMoveIds: string[], confirmationToken?: string) => Promise<DesktopOrganizeReviewResult>;
+  onRequestPublicConfirmation: (action: "organize" | "review" | "undo", batchId?: string, moveIds?: string[]) => Promise<string>;
   onOpenExclusions: () => void;
   onToggleDesktopIcons: () => Promise<void>;
+  onOrganizePublicDesktop: (confirmationToken: string) => Promise<void>;
 };
 
-function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopIconState, onClose, onUndo, onReview, onOpenExclusions, onToggleDesktopIcons }: OrganizeSheetProps) {
+function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopIconState, onClose, onUndo, onReview, onRequestPublicConfirmation, onOpenExclusions, onToggleDesktopIcons, onOrganizePublicDesktop }: OrganizeSheetProps) {
   const [excludedMoveIds, setExcludedMoveIds] = useState<Set<string>>(() => new Set());
   const [favoriteMoveIds, setFavoriteMoveIds] = useState<Set<string>>(() => new Set());
   const [reviewing, setReviewing] = useState(false);
   const [reviewResult, setReviewResult] = useState<DesktopOrganizeReviewResult | null>(null);
   const [reviewError, setReviewError] = useState("");
   const [iconsUpdating, setIconsUpdating] = useState(false);
+  const [publicOrganizeToken, setPublicOrganizeToken] = useState<string | null>(null);
+  const [publicUndoToken, setPublicUndoToken] = useState<string | null>(null);
+  const [publicReviewToken, setPublicReviewToken] = useState<string | null>(null);
+  const [publicConfirmationLoading, setPublicConfirmationLoading] = useState(false);
+  const confirmPublicOrganize = Boolean(publicOrganizeToken);
+  const confirmPublicUndo = Boolean(publicUndoToken);
+  const confirmPublicReview = Boolean(publicReviewToken);
 
   useEffect(() => {
     setExcludedMoveIds(new Set());
@@ -1595,10 +1832,24 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
     setReviewResult(null);
     setReviewError("");
     setIconsUpdating(false);
+    setPublicOrganizeToken(null);
+    setPublicUndoToken(null);
+    setPublicReviewToken(null);
+    setPublicConfirmationLoading(false);
   }, [phase, result?.batchId]);
 
+  useEffect(() => {
+    if (!confirmPublicOrganize && !confirmPublicUndo && !confirmPublicReview) return;
+    const timer = window.setTimeout(() => {
+      setPublicOrganizeToken(null);
+      setPublicUndoToken(null);
+      setPublicReviewToken(null);
+    }, 5_000);
+    return () => window.clearTimeout(timer);
+  }, [confirmPublicOrganize, confirmPublicReview, confirmPublicUndo]);
+
   if (phase === "idle") return null;
-  const busy = phase === "organizing" || phase === "undoing" || reviewing;
+  const busy = phase === "organizing" || phase === "undoing" || reviewing || publicConfirmationLoading;
   const items = result?.items ?? [];
   const skippedTotal = result?.skippedCount ?? 0;
   const publicDesktopCount = result?.publicDesktopCount ?? desktopIconState.publicDesktopCount;
@@ -1609,9 +1860,9 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
       ? "正在放回桌面…"
       : phase === "done"
         ? result?.movedCount
-          ? hasVisibleDesktopRemainders
-            ? "个人桌面已整理"
-            : "桌面已整理干净"
+          ? (result.publicMovedCount ?? 0) > 0
+            ? "公共桌面图标已收纳"
+            : "个人桌面已整理"
           : hasVisibleDesktopRemainders
             ? "没有可移动项目"
             : "桌面已经很干净"
@@ -1631,6 +1882,7 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
           : error;
 
   const toggleSelection = (setter: React.Dispatch<React.SetStateAction<Set<string>>>, moveId: string) => {
+    setPublicReviewToken(null);
     setter((current) => {
       const next = new Set(current);
       if (next.has(moveId)) next.delete(moveId);
@@ -1642,9 +1894,22 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
   const submitReview = async () => {
     if (!result?.batchId || reviewing) return;
     setReviewError("");
+    const excludedIds = [...excludedMoveIds];
+    if ((result.publicMovedCount ?? 0) > 0 && excludedIds.length > 0 && !publicReviewToken) {
+      setPublicConfirmationLoading(true);
+      try {
+        setPublicReviewToken(await onRequestPublicConfirmation("review", result.batchId, excludedIds));
+      } catch (confirmationError) {
+        setReviewError(confirmationError instanceof Error ? confirmationError.message : String(confirmationError));
+      } finally {
+        setPublicConfirmationLoading(false);
+      }
+      return;
+    }
     setReviewing(true);
     try {
-      setReviewResult(await onReview([...excludedMoveIds], [...favoriteMoveIds]));
+      setReviewResult(await onReview(excludedIds, [...favoriteMoveIds], publicReviewToken ?? undefined));
+      setPublicReviewToken(null);
     } catch (reviewFailure) {
       console.error(reviewFailure);
       setReviewError(reviewFailure instanceof Error ? reviewFailure.message : String(reviewFailure));
@@ -1674,7 +1939,7 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
           </div>
         ) : null}
         {phase === "done" && Boolean(result?.migratedCount) ? (
-          <p className="organize-migration-note"><Archive size={13} />旧整理库已迁入资料库 {result?.migratedCount} 个项目。</p>
+          <p className="organize-migration-note"><Archive size={13} />{`旧整理库已迁入资料库 ${result?.migratedCount} 个项目。`}</p>
         ) : null}
         {phase === "done" && desktopIconState.supported ? (
           <div className="public-desktop-note">
@@ -1701,17 +1966,45 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
             </button>
           </div>
         ) : null}
+        {phase === "done" && publicDesktopCount > 0 ? (
+          <div className={`public-desktop-admin-note ${confirmPublicOrganize ? "is-confirming" : ""}`}>
+            <span>
+              <Layers3 size={16} />
+              <strong>{`${publicDesktopCount} 个公共桌面项目仍在原位`}</strong>
+              <small>它们由所有 Windows 用户共享。收纳会影响其他账号，并会单独请求管理员批准。</small>
+            </span>
+            <button
+              type="button"
+              disabled={publicConfirmationLoading}
+              onClick={() => {
+                if (!confirmPublicOrganize) {
+                  setPublicConfirmationLoading(true);
+                  void onRequestPublicConfirmation("organize")
+                    .then(setPublicOrganizeToken)
+                    .catch((confirmationError) => setReviewError(confirmationError instanceof Error ? confirmationError.message : String(confirmationError)))
+                    .finally(() => setPublicConfirmationLoading(false));
+                  return;
+                }
+                const token = publicOrganizeToken;
+                setPublicOrganizeToken(null);
+                if (token) void onOrganizePublicDesktop(token);
+              }}
+            >
+              {confirmPublicOrganize ? "确认并请求管理员批准" : "收纳公共桌面"}
+            </button>
+          </div>
+        ) : null}
         {(phase === "done" || phase === "undone") && result?.skippedCount ? (
           result.skippedItems?.length ? (
             <details className="organize-skip-details">
-              <summary>{result.skippedCount} 个项目保持原位，查看原因</summary>
+              <summary>{`${result.skippedCount} 个项目保持原位，查看原因`}</summary>
               <div>
                 {result.skippedItems.slice(0, 8).map((item) => (
-                  <span key={`${item.reasonCode}-${item.path}`}><strong>{item.name}</strong><small>{item.reason}</small></span>
+                  <span key={`${item.reasonCode}-${item.path}`}><strong data-no-i18n>{item.name}</strong><small>{item.reason}</small></span>
                 ))}
               </div>
             </details>
-          ) : <p className="organize-skip-note">{result.skippedCount} 个项目保持原位。</p>
+          ) : <p className="organize-skip-note">{`${result.skippedCount} 个项目保持原位。`}</p>
         ) : null}
         {phase === "done" && items.length ? (
           <div className={`organize-review ${reviewResult ? "is-reviewed" : ""}`}>
@@ -1737,7 +2030,7 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
                         onChange={() => toggleSelection(setExcludedMoveIds, item.moveId)}
                       />
                       <span className={`review-file-icon physical-${categoryClassName(physicalCategory)}`}><Icon size={14} strokeWidth={1.9} /></span>
-                      <span className="review-file-copy"><strong>{item.name}</strong><small>{item.category}</small></span>
+                      <span className="review-file-copy"><strong data-no-i18n>{item.name}</strong><small>{item.category}</small></span>
                     </label>
                     {item.launchable ? (
                       <button
@@ -1756,21 +2049,41 @@ function OrganizeSheet({ phase, result, error, canUndo, organizedTotal, desktopI
             </div>
             {reviewResult ? (
               <p className="organize-review-feedback">
-                已放回并记住 {reviewResult.rememberedCount} 个，仍可撤销 {reviewResult.remainingUndoCount} 个。
+                {`已放回并记住 ${reviewResult.rememberedCount} 个，仍可撤销 ${reviewResult.remainingUndoCount} 个。`}
                 {reviewResult.conflictCount ? ` 另有 ${reviewResult.conflictCount} 个因重名或位置变化未能放回。` : ""}
               </p>
             ) : (
               <p className="organize-review-help">勾选后放回桌面，并记住以后不再整理同名项目。</p>
             )}
-            {reviewError ? <p className="organize-review-error">保存失败：{reviewError}</p> : null}
+            {reviewError ? <p className="organize-review-error">{`保存失败：${reviewError}`}</p> : null}
           </div>
         ) : null}
         {busy ? <div className="organize-progress"><i /><i /><i /></div> : null}
         {!busy ? (
           <div className="organize-sheet-actions">
-            {phase === "done" && canUndo ? <button className="organize-undo" onClick={onUndo}>撤销整理</button> : null}
+            {phase === "done" && canUndo ? (
+              <button
+                className={`organize-undo ${confirmPublicUndo ? "is-confirming" : ""}`}
+                disabled={publicConfirmationLoading}
+                onClick={() => {
+                  if ((result?.publicMovedCount ?? 0) > 0 && !confirmPublicUndo) {
+                    setPublicConfirmationLoading(true);
+                    void onRequestPublicConfirmation("undo", result?.batchId)
+                      .then(setPublicUndoToken)
+                      .catch((confirmationError) => setReviewError(confirmationError instanceof Error ? confirmationError.message : String(confirmationError)))
+                      .finally(() => setPublicConfirmationLoading(false));
+                    return;
+                  }
+                  const token = publicUndoToken ?? undefined;
+                  setPublicUndoToken(null);
+                  onUndo(token);
+                }}
+              >
+                {confirmPublicUndo ? "确认撤销公共桌面收纳" : "撤销整理"}
+              </button>
+            ) : null}
             {phase === "done" && items.length && !reviewResult ? (
-              <button className="organize-finish" onClick={() => void submitReview()}>保存复查</button>
+              <button className="organize-finish" onClick={() => void submitReview()}>{confirmPublicReview ? "确认放回公共桌面" : "保存复查"}</button>
             ) : (
               <button className="organize-finish" onClick={onClose}>完成</button>
             )}
@@ -1803,7 +2116,7 @@ function ExclusionsSheet({ open, exclusions, loading, onClose, onRemove }: Exclu
           {exclusions.map((item) => (
             <article className="exclusion-row" key={item.nameKey}>
               <span className="exclusion-icon">{item.isDirectory ? <Folder size={15} /> : <File size={15} />}</span>
-              <span><strong>{item.displayName}</strong><small>{relativeTime(item.createdAt)}</small></span>
+              <span><strong data-no-i18n>{item.displayName}</strong><small>{relativeTime(item.createdAt)}</small></span>
               <button onClick={() => onRemove(item.nameKey)} aria-label={`不再忽略 ${item.displayName}`} title="移出忽略名单"><Trash2 size={14} /></button>
             </article>
           ))}
@@ -1842,6 +2155,7 @@ function RestOverlay({
   species,
   theme,
   evolution,
+  evolutionStage,
   stage,
   onRequestExit,
   onStageComplete,
@@ -1852,6 +2166,7 @@ function RestOverlay({
   species: PetSpecies;
   theme: PetTheme;
   evolution: EvolutionPath;
+  evolutionStage: EvolutionStage;
   stage: RestStage;
   onRequestExit: () => void;
   onStageComplete: (stage: RestStage) => void;
@@ -1955,7 +2270,7 @@ function RestOverlay({
       <section className="rest-copy">
         <span><Coffee size={17} />{isRecovery ? "安全恢复" : "强制休息中"}</span>
         <h1 id="rest-title">{isRecovery ? "再试一次，就能回到桌面" : "把眼睛从屏幕移开一下"}</h1>
-        <p id="rest-description">{isRecovery ? "窗口恢复刚才没有完成，宠物和真实鼠标都仍然可用。" : `站起来、喝口水，看看远处。${petName}会安静地替你守着桌面。`}</p>
+        <p id="rest-description">{isRecovery ? "窗口恢复刚才没有完成，宠物和真实鼠标都仍然可用。" : <>站起来、喝口水，看看远处。<span data-no-i18n>{petName}</span>会安静地替你守着桌面。</>}</p>
         <time aria-label={`剩余休息时间 ${formatCountdown(seconds)}`}>{formatCountdown(seconds)}</time>
         <p className="rest-safety-note" id="rest-safety-note"><MousePointer2 size={14} />这只是可爱动画，真实鼠标始终可见、可用</p>
       </section>
@@ -1967,6 +2282,8 @@ function RestOverlay({
         <PetSprite
           species={species}
           action={petAction}
+          evolutionStage={evolutionStage}
+          evolutionPath={evolution}
           motionMode="quiet"
           className="pet-sprite--rest"
           lookX={0}
@@ -1998,6 +2315,12 @@ function DesktopPetWindow() {
   const [species] = usePersistentState<PetSpecies>(petStorageKeys.species, "star-cat");
   const [theme] = usePersistentState<PetTheme>(petStorageKeys.theme, "lilac");
   const [evolution] = usePersistentState<EvolutionPath>(petStorageKeys.evolution, "companion");
+  const [autoEvolution] = usePersistentState<boolean>(petStorageKeys.autoEvolution, true);
+  const [evolutionMetrics] = usePersistentState<PetEvolutionMetrics>(petStorageKeys.evolutionMetrics, defaultPetEvolutionMetrics, mergePetEvolutionMetrics);
+  const evolutionState = useMemo(() => calculatePetEvolution(evolutionMetrics), [evolutionMetrics]);
+  const [manualEvolutionStage] = usePersistentState<EvolutionStage>(petStorageKeys.manualEvolutionStage, evolutionState.stage);
+  const effectiveEvolution = autoEvolution ? evolutionState.path : evolution;
+  const effectiveEvolutionStage = autoEvolution ? evolutionState.stage : manualEvolutionStage;
   const [motionMode] = usePersistentState<PetMotionMode>(petStorageKeys.motionMode, "gentle");
   const [dialogueEnabled] = usePersistentState<boolean>(petStorageKeys.dialogueEnabled, true);
   const [cursor, setCursor] = useState<CursorPoint>({ x: 75, y: 40 });
@@ -2190,7 +2513,7 @@ function DesktopPetWindow() {
 
   return (
     <main
-      className={`desktop-pet-window ${petClassName(species, theme, evolution)} action-${spriteAction} ${dropHover ? "is-drop-target" : ""}`}
+      className={`desktop-pet-window ${petClassName(species, theme, effectiveEvolution)} action-${spriteAction} ${dropHover ? "is-drop-target" : ""}`}
       data-tauri-drag-region
       {...dragHandlers}
       onDragOver={handleDomDragOver}
@@ -2208,6 +2531,8 @@ function DesktopPetWindow() {
         <PetSprite
           species={species}
           action={spriteAction}
+          evolutionStage={effectiveEvolutionStage}
+          evolutionPath={effectiveEvolution}
           motionMode={runtimeSnapshot?.behaviorMode ?? motionMode}
           className="pet-sprite--desktop"
           lookX={look.x}
@@ -2229,7 +2554,7 @@ function DesktopPetWindow() {
             void publishPetRuntimeAnimationEnd({ actionInstanceId: runtimeSnapshot.actionInstanceId, atEpochMs: Date.now() }).catch(console.error);
           }}
         />
-        <span className="floating-badge pet-sprite-badge">{evolutionBadges[evolution]}</span>
+        <span className="floating-badge pet-sprite-badge">{evolutionBadges[effectiveEvolution]}</span>
       </div>
     </main>
   );
@@ -2240,12 +2565,43 @@ function PetDialogueWindow() {
   const [dialogueEnabled] = usePersistentState<boolean>(petStorageKeys.dialogueEnabled, true);
   const [voiceEnabled] = usePersistentState<boolean>(petStorageKeys.voiceEnabled, false);
   const [connectorId, setConnectorId] = usePersistentState<DialogueConnectorId>("wormhole-pie.agent.connector.v1", "local");
-  const [agentWorkspace] = usePersistentState<string>("wormhole-pie.agent.workspace.v1", "");
+  const [legacyAgentWorkspace, setLegacyAgentWorkspace] = usePersistentState<string>("wormhole-pie.agent.workspace.v1", "");
+  const [storedDialogueSessions, setStoredDialogueSessions] = usePersistentState<DialogueSessions>(
+    dialogueSessionStorageKey,
+    createDialogueSessions(),
+    mergeDialogueSessions,
+  );
+  const dialogueSessions = normalizeDialogueSessions(storedDialogueSessions);
+  const selectedSession = dialogueSessions[connectorId];
+  const updatePetDialogueSession = useCallback((targetConnector: DialogueConnectorId, patch: Partial<DialogueSession> | ((current: DialogueSession) => Partial<DialogueSession>)) => {
+    setStoredDialogueSessions((currentValue) => {
+      const current = normalizeDialogueSessions(currentValue);
+      const session = current[targetConnector];
+      const resolved = typeof patch === "function" ? patch(session) : patch;
+      return {
+        ...current,
+        [targetConnector]: updateDialogueSessionFields(targetConnector, session, resolved),
+      };
+    });
+  }, [setStoredDialogueSessions]);
   const [connectors, setConnectors] = useState<AgentConnectorStatus[]>([]);
   const [state, setState] = useState<DialogueState>({ userMessage: "", reply: "想让我做什么？", listening: false, busy: false, connectorId: "local" });
   const [agentTaskStatus, setAgentTaskStatus] = useState<AgentTaskStatus | null>(null);
-  const taskBusy = state.busy || isAgentTaskActive(agentTaskStatus);
+  const taskBusy = (isAgentTaskActive(agentTaskStatus) && agentTaskStatus?.connectorId === connectorId)
+    || selectedSession.busy
+    || (state.busy === true && state.connectorId === connectorId);
   const taskTiming = useAgentTaskTiming(taskBusy, agentTaskStatus);
+
+  useEffect(() => {
+    setStoredDialogueSessions((current) => normalizeDialogueSessions(current));
+  }, [setStoredDialogueSessions]);
+
+  useEffect(() => {
+    const legacyWorkspace = legacyAgentWorkspace.trim();
+    if (!legacyWorkspace) return;
+    updatePetDialogueSession(connectorId, (current) => current.workspace.trim() ? {} : { workspace: legacyWorkspace });
+    setLegacyAgentWorkspace("");
+  }, [connectorId, legacyAgentWorkspace, setLegacyAgentWorkspace, updatePetDialogueSession]);
 
   useEffect(() => {
     let cancelled = false;
@@ -2262,7 +2618,9 @@ function PetDialogueWindow() {
     let cancelled = false;
     subscribeToDialogueState((next) => {
       setState(next);
-      if (next.connectorId) setConnectorId(next.connectorId);
+      if (next.sessions) {
+        setStoredDialogueSessions((current) => mergeDialogueSessions(current, next.sessions));
+      }
       void listAgentConnectors().then(setConnectors).catch(console.error);
     }).then((unlisten) => {
       if (cancelled) unlisten();
@@ -2272,7 +2630,7 @@ function PetDialogueWindow() {
       cancelled = true;
       cleanup?.();
     };
-  }, []);
+  }, [setStoredDialogueSessions]);
 
   useEffect(() => {
     if (!taskBusy) return;
@@ -2281,6 +2639,8 @@ function PetDialogueWindow() {
       void getAgentTaskStatus().then((next) => {
         if (cancelled || !next) return;
         setAgentTaskStatus((current) => !current || next.updatedAt >= current.updatedAt ? next : current);
+        const active = isAgentTaskActive(next);
+        updatePetDialogueSession(next.connectorId, { busy: active, activeTaskId: active ? next.taskId : null });
       }).catch(console.error);
     };
     const timer = window.setInterval(poll, 4_000);
@@ -2288,7 +2648,7 @@ function PetDialogueWindow() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [taskBusy]);
+  }, [taskBusy, updatePetDialogueSession]);
 
   useEffect(() => {
     let cleanup: undefined | (() => void);
@@ -2296,10 +2656,22 @@ function PetDialogueWindow() {
     const acceptStatus = (next: AgentTaskStatus) => {
       if (cancelled) return;
       setAgentTaskStatus((current) => !current || next.updatedAt >= current.updatedAt ? next : current);
+      const active = isAgentTaskActive(next);
+      updatePetDialogueSession(next.connectorId, { busy: active, activeTaskId: active ? next.taskId : null });
     };
     void getAgentTaskStatus().then((next) => {
       if (next) acceptStatus(next);
-    }).catch(console.error);
+      else (["codex", "claude", "hermes"] as const).forEach((targetConnector) => {
+        updatePetDialogueSession(targetConnector, { busy: false, activeTaskId: null });
+      });
+    }).catch((error) => {
+      console.error(error);
+      if (cancelled) return;
+      setAgentTaskStatus(null);
+      (["codex", "claude", "hermes"] as const).forEach((targetConnector) => {
+        updatePetDialogueSession(targetConnector, { busy: false, activeTaskId: null });
+      });
+    });
     void subscribeToAgentTaskStatus(acceptStatus).then((unlisten) => {
       if (cancelled) unlisten();
       else cleanup = unlisten;
@@ -2308,7 +2680,7 @@ function PetDialogueWindow() {
       cancelled = true;
       cleanup?.();
     };
-  }, []);
+  }, [updatePetDialogueSession]);
 
   useEffect(() => {
     if (!dialogueEnabled) void hidePetDialogue().catch(console.error);
@@ -2316,51 +2688,63 @@ function PetDialogueWindow() {
 
   const recognize = useCallback(async () => {
     if (!voiceEnabled) {
-      setState((current) => ({ ...current, reply: "本地语音还没开启，可以先打字，或在宠物设置里打开。" }));
+      updatePetDialogueSession(connectorId, (current) => appendDialogueAssistantMessage(current, "本地语音还没开启，可以先打字，或在宠物设置里打开。"));
       return null;
     }
-    setState((current) => ({ ...current, listening: true, reply: "我在听。" }));
+    setState((current) => ({ ...current, listening: true }));
+    updatePetDialogueSession(connectorId, (current) => setDialogueSessionPreview(current, "我在听。"));
     try {
       return await recognizeLocalSpeech();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setState((current) => ({ ...current, reply: message }));
+      updatePetDialogueSession(connectorId, (current) => appendDialogueAssistantMessage(current, message));
       return null;
     } finally {
       setState((current) => ({ ...current, listening: false }));
     }
-  }, [voiceEnabled]);
+  }, [connectorId, updatePetDialogueSession, voiceEnabled]);
 
   const sendCommand = useCallback(async (submission: DialogueSubmission) => {
+    updatePetDialogueSession(connectorId, (current) => ({
+      ...appendDialogueUserMessage(current, submission.text),
+      busy: connectorId !== "local",
+      activeTaskId: connectorId === "local" ? null : current.activeTaskId ?? "pending",
+    }));
     setState((current) => ({ ...current, userMessage: submission.text, busy: connectorId !== "local", connectorId, resultFiles: [] }));
     try {
       await sendDialogueCommand({ ...submission, connectorId });
     } catch (error) {
       console.error(error);
-      setState((current) => ({ ...current, busy: false, reply: "这句话没有送出去，再试一次吧。" }));
+      setState((current) => ({ ...current, busy: false }));
+      updatePetDialogueSession(connectorId, (current) => appendDialogueAssistantMessage({ ...current, busy: false, activeTaskId: null }, "这句话没有送出去，再试一次吧。"));
       throw error;
     }
-  }, [connectorId]);
+  }, [connectorId, updatePetDialogueSession]);
 
   const stopCurrentTask = useCallback(() => {
     if (!taskBusy) return;
-    setState((current) => ({ ...current, busy: true, reply: "正在温柔停下来…" }));
+    const taskConnector = agentTaskStatus?.connectorId ?? (connectorId === "local" ? undefined : connectorId);
+    if (!taskConnector) return;
+    setState((current) => ({ ...current, busy: true }));
+    updatePetDialogueSession(taskConnector, (current) => setDialogueSessionPreview(current, "正在温柔停下来…"));
     const activeTaskId = agentTaskStatus && isAgentTaskActive(agentTaskStatus) ? agentTaskStatus.taskId : undefined;
     void stopAgentTask(activeTaskId).catch((error) => {
       console.error(error);
-      setState((current) => ({ ...current, reply: "暂时没能停下来，再试一次吧。" }));
+      updatePetDialogueSession(taskConnector, (current) => appendDialogueAssistantMessage(current, "暂时没能停下来，再试一次吧。"));
     });
-  }, [agentTaskStatus, taskBusy]);
+  }, [agentTaskStatus, connectorId, taskBusy, updatePetDialogueSession]);
 
   const openResultFile = useCallback(async (file: AgentResultFile) => {
     try {
-      const workspace = agentWorkspace.trim() || await getAgentDefaultWorkspace();
+      const sessionWorkspace = selectedSession.workspace.trim();
+      const workspace = sessionWorkspace || await getAgentDefaultWorkspace();
+      if (!sessionWorkspace) updatePetDialogueSession(connectorId, { workspace });
       await openAgentResultFile(file.path, workspace);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setState((current) => ({ ...current, reply: message || "这个文件暂时打不开。" }));
+      updatePetDialogueSession(connectorId, (current) => appendDialogueAssistantMessage(current, message || "这个文件暂时打不开。"));
     }
-  }, [agentWorkspace]);
+  }, [connectorId, selectedSession.workspace, updatePetDialogueSession]);
 
   if (!dialogueEnabled) return null;
 
@@ -2369,22 +2753,29 @@ function PetDialogueWindow() {
       open
       standalone
       petName={petName || "派派"}
-      userMessage={state.userMessage}
-      reply={state.reply}
+      userMessage={selectedSession.userMessage}
+      reply={selectedSession.reply}
+      messages={selectedSession.messages}
+      draft={selectedSession.draft}
+      attachmentPaths={selectedSession.attachmentPaths}
       voiceEnabled={voiceEnabled}
       isListening={state.listening}
       busy={taskBusy}
       busyElapsedMs={taskTiming.elapsedMs}
       busyHeartbeatKnown={taskTiming.heartbeatKnown}
       busyHeartbeatFresh={taskTiming.heartbeatFresh}
-      busyCancelling={agentTaskStatus?.state === "cancelling" || agentTaskStatus?.cancelRequested === true}
+      busyCancelling={agentTaskStatus?.connectorId === connectorId && (agentTaskStatus.state === "cancelling" || agentTaskStatus.cancelRequested === true)}
       connectorId={connectorId}
       connectors={connectors}
-      resultFiles={state.resultFiles}
+      resultFiles={selectedSession.resultFiles}
       onClose={() => void hidePetDialogue().catch(console.error)}
       onSubmit={sendCommand}
       onMic={recognize}
       onConnector={setConnectorId}
+      onDraftChange={(draft) => updatePetDialogueSession(connectorId, { draft })}
+      onAttachmentPathsChange={(next) => updatePetDialogueSession(connectorId, (current) => ({
+        attachmentPaths: typeof next === "function" ? next(current.attachmentPaths) : next,
+      }))}
       onOpenResultFile={openResultFile}
       onStop={taskBusy ? stopCurrentTask : undefined}
     />
@@ -2408,16 +2799,61 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
   const [fileFilter, setFileFilter] = useState<FileFilter>("all");
   const [libraryArrangeMode, setLibraryArrangeMode] = usePersistentState<LibraryArrangeMode>("wormhole-pie.library.arrangeMode.v1", "type");
   const [customSocialShortcuts, setCustomSocialShortcuts] = usePersistentState<CustomSocialShortcut[]>("wormhole-pie.social.shortcuts.v1", []);
-  const [assistantMessage, setAssistantMessage] = useState("");
-  const [lastUserMessage, setLastUserMessage] = useState("");
+  const [socialAccounts, setSocialAccounts] = useState<SocialAccountSnapshot[]>([]);
+  const [socialAccountsLoading, setSocialAccountsLoading] = useState(false);
   const [dialogueOpen, setDialogueOpen] = useState(false);
   const [agentConnector, setAgentConnector] = usePersistentState<DialogueConnectorId>("wormhole-pie.agent.connector.v1", "local");
+  const agentConnectorRef = useRef(agentConnector);
+  agentConnectorRef.current = agentConnector;
+  const [storedDialogueSessions, setStoredDialogueSessions] = usePersistentState<DialogueSessions>(
+    dialogueSessionStorageKey,
+    createDialogueSessions(),
+    mergeDialogueSessions,
+  );
+  const dialogueSessions = normalizeDialogueSessions(storedDialogueSessions);
+  const dialogueSessionsRef = useRef(dialogueSessions);
+  dialogueSessionsRef.current = dialogueSessions;
+  const activeDialogueSession = dialogueSessions[agentConnector];
+  const assistantMessage = activeDialogueSession.reply;
+  const lastUserMessage = activeDialogueSession.userMessage;
+  const agentResultFiles = activeDialogueSession.resultFiles;
+  const updateDialogueSession = useCallback((connectorId: DialogueConnectorId, patch: Partial<DialogueSession> | ((current: DialogueSession) => Partial<DialogueSession>)) => {
+    setStoredDialogueSessions((currentValue) => {
+      const current = normalizeDialogueSessions(currentValue);
+      const session = current[connectorId];
+      const resolved = typeof patch === "function" ? patch(session) : patch;
+      return {
+        ...current,
+        [connectorId]: updateDialogueSessionFields(connectorId, session, resolved),
+      };
+    });
+  }, [setStoredDialogueSessions]);
+  useEffect(() => {
+    setStoredDialogueSessions((current) => normalizeDialogueSessions(current));
+  }, [setStoredDialogueSessions]);
+  const recordSessionUserMessage = useCallback((connectorId: DialogueConnectorId, message: string) => {
+    updateDialogueSession(connectorId, (current) => appendDialogueUserMessage(current, message));
+  }, [updateDialogueSession]);
+  const recordSessionAssistantMessage = useCallback((connectorId: DialogueConnectorId, message: string, files: AgentResultFile[] = [], taskId?: string) => {
+    updateDialogueSession(connectorId, (current) => appendDialogueAssistantMessage(current, message, files, taskId));
+  }, [updateDialogueSession]);
+  const previewSessionAssistantMessage = useCallback((connectorId: DialogueConnectorId, message: string, files?: AgentResultFile[]) => {
+    updateDialogueSession(connectorId, (current) => setDialogueSessionPreview(current, message, files));
+  }, [updateDialogueSession]);
+  const setAssistantMessage = useCallback((next: string | ((current: string) => string)) => {
+    updateDialogueSession("local", (current) => appendDialogueAssistantMessage(current, typeof next === "function" ? next(current.reply) : next));
+  }, [updateDialogueSession]);
+  const setLastUserMessage = useCallback((next: string | ((current: string) => string)) => {
+    agentConnectorRef.current = "local";
+    setAgentConnector("local");
+    updateDialogueSession("local", (current) => appendDialogueUserMessage(current, typeof next === "function" ? next(current.userMessage) : next));
+  }, [setAgentConnector, updateDialogueSession]);
   const [agentConnectors, setAgentConnectors] = useState<AgentConnectorStatus[]>([]);
   const [agentConnectorsLoading, setAgentConnectorsLoading] = useState(false);
   const [agentConnectorScanMessage, setAgentConnectorScanMessage] = useState("");
-  const [agentWorkspace, setAgentWorkspace] = usePersistentState<string>("wormhole-pie.agent.workspace.v1", "");
+  const [legacyAgentWorkspace, setLegacyAgentWorkspace] = usePersistentState<string>("wormhole-pie.agent.workspace.v1", "");
   const [agentBusy, setAgentBusy] = useState(false);
-  const [agentResultFiles, setAgentResultFiles] = useState<AgentResultFile[]>([]);
+  const [agentBusyConnector, setAgentBusyConnector] = useState<AgentConnectorId | null>(null);
   const [agentTaskStatus, setAgentTaskStatus] = useState<AgentTaskStatus | null>(null);
   const [lastDeliveredAgentTaskId, setLastDeliveredAgentTaskId] = usePersistentState<string>("wormhole-pie.agent.lastDeliveredTask.v1", "");
   const lastDeliveredAgentTaskIdRef = useRef(lastDeliveredAgentTaskId);
@@ -2463,6 +2899,12 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
   const [petSpecies, setPetSpecies] = usePersistentState<PetSpecies>(petStorageKeys.species, "star-cat");
   const [petTheme, setPetTheme] = usePersistentState<PetTheme>(petStorageKeys.theme, "lilac");
   const [evolution, setEvolution] = usePersistentState<EvolutionPath>(petStorageKeys.evolution, "companion");
+  const [autoEvolution, setAutoEvolution] = usePersistentState<boolean>(petStorageKeys.autoEvolution, true);
+  const [evolutionMetrics, setEvolutionMetrics] = usePersistentState<PetEvolutionMetrics>(petStorageKeys.evolutionMetrics, defaultPetEvolutionMetrics, mergePetEvolutionMetrics);
+  const evolutionState = useMemo(() => calculatePetEvolution(evolutionMetrics), [evolutionMetrics]);
+  const [manualEvolutionStage, setManualEvolutionStage] = usePersistentState<EvolutionStage>(petStorageKeys.manualEvolutionStage, evolutionState.stage);
+  const effectiveEvolution = autoEvolution ? evolutionState.path : evolution;
+  const effectiveEvolutionStage = autoEvolution ? evolutionState.stage : manualEvolutionStage;
   const [petMotionMode, setPetMotionMode] = usePersistentState<PetMotionMode>(petStorageKeys.motionMode, "gentle");
   const [dialogueEnabled, setDialogueEnabled] = usePersistentState<boolean>(petStorageKeys.dialogueEnabled, true);
   const [voiceEnabled, setVoiceEnabled] = usePersistentState<boolean>(petStorageKeys.voiceEnabled, false);
@@ -2471,11 +2913,34 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
   const [organizeResult, setOrganizeResult] = useState<DesktopOrganizeResult | null>(null);
   const [organizeError, setOrganizeError] = useState("");
   const [canUndoOrganize, setCanUndoOrganize] = useState(false);
+  const [latestUndoTouchesPublicDesktop, setLatestUndoTouchesPublicDesktop] = useState(false);
   const [desktopIconState, setDesktopIconState] = useState<DesktopIconState>({ supported: true, hidden: false, publicDesktopCount: 0 });
   const suppressFileNoticeUntil = useRef(0);
   const expectedPetVisibilityEvents = useRef<boolean[]>([]);
   const agentTaskRunning = agentBusy || isAgentTaskActive(agentTaskStatus);
-  const agentTaskTiming = useAgentTaskTiming(agentTaskRunning, agentTaskStatus);
+  const runningAgentConnector = isAgentTaskActive(agentTaskStatus) ? agentTaskStatus?.connectorId ?? null : agentBusyConnector;
+  const activeConnectorBusy = agentTaskRunning && runningAgentConnector === agentConnector;
+  const agentTaskTiming = useAgentTaskTiming(activeConnectorBusy, agentTaskStatus);
+  const activeAgentWorkspace = activeDialogueSession.workspace.trim();
+  const updateActiveAgentWorkspace = useCallback((workspace: string) => {
+    updateDialogueSession(agentConnectorRef.current, { workspace });
+  }, [updateDialogueSession]);
+
+  useEffect(() => {
+    const today = localDateKey();
+    setEvolutionMetrics((current) => current.activeDays.includes(today) ? current : {
+      ...current,
+      activeDays: [...current.activeDays, today].slice(-365),
+    });
+  }, [setEvolutionMetrics]);
+
+  useEffect(() => {
+    setSocialAccountsLoading(true);
+    void listSocialAccounts()
+      .then(setSocialAccounts)
+      .catch(console.error)
+      .finally(() => setSocialAccountsLoading(false));
+  }, []);
 
   const todayTodos = useMemo(() => todos.filter((todo) => (todo.date ?? todayKey) === todayKey), [todayKey, todos]);
   const pendingTodos = useMemo(() => todayTodos.filter((todo) => todo.status !== "done").length, [todayTodos]);
@@ -2531,24 +2996,46 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
       .then(([items, defaultWorkspace]) => {
         if (cancelled) return;
         setAgentConnectors(items);
-        setAgentWorkspace((current) => current.trim() ? current : defaultWorkspace);
-        setAgentConnector((current) => current !== "local" && !items.some((item) => item.id === current && isAgentConnectorReady(item)) ? "local" : current);
+        const currentConnector = agentConnectorRef.current;
+        const nextConnector = currentConnector !== "local" && !items.some((item) => item.id === currentConnector && isAgentConnectorReady(item)) ? "local" : currentConnector;
+        if (nextConnector !== currentConnector) {
+          agentConnectorRef.current = nextConnector;
+          setAgentConnector(nextConnector);
+        }
+        const sessionWorkspace = dialogueSessionsRef.current[nextConnector].workspace.trim();
+        if (!sessionWorkspace) updateDialogueSession(nextConnector, { workspace: legacyAgentWorkspace.trim() || defaultWorkspace });
+        if (legacyAgentWorkspace.trim()) setLegacyAgentWorkspace("");
       })
       .catch(console.error);
     return () => { cancelled = true; };
-  }, [setAgentConnector, setAgentWorkspace]);
+  }, [legacyAgentWorkspace, setAgentConnector, setLegacyAgentWorkspace, updateDialogueSession]);
 
   useEffect(() => {
     let cleanup: undefined | (() => void);
     let cancelled = false;
     const acceptStatus = (next: AgentTaskStatus) => {
       if (cancelled) return;
+      const active = isAgentTaskActive(next);
       setAgentTaskStatus((current) => !current || next.updatedAt >= current.updatedAt ? next : current);
-      setAgentBusy(isAgentTaskActive(next));
+      setAgentBusy(active);
+      setAgentBusyConnector(active ? next.connectorId : null);
+      updateDialogueSession(next.connectorId, { busy: active, activeTaskId: active ? next.taskId : null });
     };
     void getAgentTaskStatus().then((next) => {
       if (next) acceptStatus(next);
-    }).catch(console.error);
+      else {
+        setAgentBusy(false);
+        setAgentBusyConnector(null);
+        (["codex", "claude", "hermes"] as const).forEach((connectorId) => updateDialogueSession(connectorId, { busy: false, activeTaskId: null }));
+      }
+    }).catch((error) => {
+      console.error(error);
+      if (cancelled) return;
+      setAgentTaskStatus(null);
+      setAgentBusy(false);
+      setAgentBusyConnector(null);
+      (["codex", "claude", "hermes"] as const).forEach((connectorId) => updateDialogueSession(connectorId, { busy: false, activeTaskId: null }));
+    });
     void subscribeToAgentTaskStatus(acceptStatus).then((unlisten) => {
       if (cancelled) unlisten();
       else cleanup = unlisten;
@@ -2557,7 +3044,7 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
       cancelled = true;
       cleanup?.();
     };
-  }, []);
+  }, [updateDialogueSession]);
 
   useEffect(() => {
     if (!agentTaskRunning) return;
@@ -2565,8 +3052,11 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
     const poll = () => {
       void getAgentTaskStatus().then((next) => {
         if (cancelled || !next) return;
+        const active = isAgentTaskActive(next);
         setAgentTaskStatus((current) => !current || next.updatedAt >= current.updatedAt ? next : current);
-        setAgentBusy(isAgentTaskActive(next));
+        setAgentBusy(active);
+        setAgentBusyConnector(active ? next.connectorId : null);
+        updateDialogueSession(next.connectorId, { busy: active, activeTaskId: active ? next.taskId : null });
       }).catch(console.error);
     };
     const timer = window.setInterval(poll, 4_000);
@@ -2574,7 +3064,7 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [agentTaskRunning]);
+  }, [agentTaskRunning, updateDialogueSession]);
 
   useEffect(() => {
     lastDeliveredAgentTaskIdRef.current = lastDeliveredAgentTaskId;
@@ -2883,24 +3373,41 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
 
   const deliverRecoveredAgentResult = useCallback((result: AgentTaskResult) => {
     if (agentInvokeOwnedRef.current || !result.taskId || result.taskId === lastDeliveredAgentTaskIdRef.current) return;
+    const targetSession = dialogueSessionsRef.current[result.connectorId];
+    if (!targetSession || result.appSessionId !== targetSession.appSessionId) return;
     lastDeliveredAgentTaskIdRef.current = result.taskId;
     setLastDeliveredAgentTaskId(result.taskId);
     setAgentBusy(false);
-    setAgentResultFiles(result.files ?? []);
+    setAgentBusyConnector(null);
     const connectorName = agentConnectors.find((connector) => connector.id === result.connectorId)?.name ?? result.connectorId;
     const output = result.output.trim();
     if (result.success) {
-      setAssistantMessage(output || "任务完成啦。");
+      updateDialogueSession(result.connectorId, (current) => ({
+        ...appendDialogueAssistantMessage(current, output || "任务完成啦。", result.files ?? [], result.taskId),
+        providerSessionId: result.failureCode === "session_not_found" ? null : result.providerSessionId ?? current.providerSessionId,
+        busy: false,
+        activeTaskId: null,
+      }));
       sendMainPetSignal("task_completed", { source: "agent", payload: { connectorId: result.connectorId, durationMs: result.durationMs, recovered: true } });
       addNotice(`${connectorName} 已完成任务`, "结果已经重新送回宠物对话。", "action");
     } else if (result.cancelled) {
-      setAssistantMessage("任务已经停下来了。");
+      updateDialogueSession(result.connectorId, (current) => ({
+        ...appendDialogueAssistantMessage(current, "任务已经停下来了。", result.files ?? [], result.taskId),
+        providerSessionId: result.failureCode === "session_not_found" ? null : result.providerSessionId ?? current.providerSessionId,
+        busy: false,
+        activeTaskId: null,
+      }));
       sendMainPetSignal("task_failed", { source: "agent", payload: { connectorId: result.connectorId, cancelled: true, recovered: true } });
     } else {
-      setAssistantMessage(output || (result.timedOut ? "任务达到长时安全上限，已经停止。" : "任务没有完成，请稍后再试。"));
+      updateDialogueSession(result.connectorId, (current) => ({
+        ...appendDialogueAssistantMessage(current, output || (result.timedOut ? "任务达到长时安全上限，已经停止。" : "任务没有完成，请稍后再试。"), result.files ?? [], result.taskId),
+        providerSessionId: result.failureCode === "session_not_found" ? null : result.providerSessionId ?? current.providerSessionId,
+        busy: false,
+        activeTaskId: null,
+      }));
       sendMainPetSignal("task_failed", { source: "agent", payload: { connectorId: result.connectorId, timedOut: result.timedOut, recovered: true } });
     }
-  }, [addNotice, agentConnectors, sendMainPetSignal, setLastDeliveredAgentTaskId]);
+  }, [addNotice, agentConnectors, sendMainPetSignal, setLastDeliveredAgentTaskId, updateDialogueSession]);
 
   useEffect(() => {
     let cleanup: undefined | (() => void);
@@ -2989,47 +3496,67 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
     }
   }, [desktopIconState.hidden]);
 
-  const handleOrganizeDesktop = useCallback(async () => {
+  const handleOrganizeDesktop = useCallback(async (includePublicDesktop = false, confirmationToken?: string) => {
     suppressFileNoticeUntil.current = Date.now() + 2500;
-    setLastUserMessage("一键整理桌面");
+    setLastUserMessage(includePublicDesktop ? "收纳公共桌面" : "一键整理个人桌面");
     setDialogueOpen(false);
     setOrganizeError("");
     setOrganizePhase("organizing");
     try {
-      const result = await organizeDesktop();
+      const result = await organizeDesktop(includePublicDesktop, confirmationToken);
       setOrganizeResult(result);
       remapFavoriteProgramPaths(result.items ?? [], "organized");
       const [, , organizeState] = await Promise.all([loadFiles(), loadCommonPrograms(), getOrganizeState()]);
       setCanUndoOrganize(organizeState.canUndo);
+      setLatestUndoTouchesPublicDesktop(organizeState.latestBatchTouchesPublicDesktop);
       if (typeof result.publicDesktopCount === "number") {
         setDesktopIconState((current) => ({ ...current, publicDesktopCount: result.publicDesktopCount ?? current.publicDesktopCount }));
       }
       const skipped = result.skippedCount;
       const newMoved = result.newMovedCount ?? result.movedCount;
+      if (newMoved > 0) {
+        setEvolutionMetrics((current) => ({ ...current, organizedFiles: current.organizedFiles + newMoved }));
+      }
       const migrated = result.migratedCount ?? 0;
-      setAssistantMessage(newMoved ? `本次新增整理了 ${newMoved} 个项目，跳过 ${skipped} 个。` : migrated ? `旧整理库的 ${migrated} 个项目已迁入资料库。` : `没有新增项目，跳过 ${skipped} 个。` );
-      addNotice("桌面整理完成", result.movedCount ? `${result.movedCount} 个项目已移入“虫洞派资料库”。` : "桌面没有需要移动的项目。", "file");
+      setAssistantMessage(newMoved
+        ? `${includePublicDesktop ? "公共桌面" : "个人桌面"}新增整理了 ${newMoved} 个项目，跳过 ${skipped} 个。`
+        : migrated
+          ? `旧整理库的 ${migrated} 个项目已迁入资料库。`
+          : `没有新增项目，跳过 ${skipped} 个。`);
+      addNotice(
+        includePublicDesktop ? "公共桌面收纳完成" : "个人桌面整理完成",
+        result.movedCount ? `${result.movedCount} 个项目已移入“虫洞派资料库”。` : "桌面没有需要移动的项目。",
+        "file",
+      );
       setOrganizePhase("done");
     } catch (error) {
       console.error(error);
       const message = error instanceof Error ? error.message : String(error);
       setOrganizeError(message);
-      setAssistantMessage("这次没整理好，桌面没有被半途改乱。" );
+      setAssistantMessage(includePublicDesktop ? "公共桌面没有改动；管理员批准可能被取消或移动未通过安全检查。" : "这次没整理好，桌面没有被半途改乱。" );
       setOrganizePhase("error");
     }
-  }, [addNotice, loadCommonPrograms, loadFiles, remapFavoriteProgramPaths]);
+  }, [addNotice, loadCommonPrograms, loadFiles, remapFavoriteProgramPaths, setEvolutionMetrics]);
 
-  const handleUndoDesktopOrganize = useCallback(async () => {
+  const handleUndoDesktopOrganize = useCallback(async (confirmationToken?: string) => {
     suppressFileNoticeUntil.current = Date.now() + 2500;
     setDialogueOpen(false);
     setOrganizeError("");
     setOrganizePhase("undoing");
     try {
-      const result = await undoDesktopOrganize();
+      const result = await undoDesktopOrganize(confirmationToken);
       setOrganizeResult(result);
       remapFavoriteProgramPaths(result.items ?? [], "original");
+      const restoredDesktopItems = result.newMovedCount ?? result.movedCount;
+      if (restoredDesktopItems > 0) {
+        setEvolutionMetrics((current) => ({
+          ...current,
+          organizedFiles: Math.max(0, current.organizedFiles - restoredDesktopItems),
+        }));
+      }
       const [, , organizeState] = await Promise.all([loadFiles(), loadCommonPrograms(), getOrganizeState()]);
       setCanUndoOrganize(organizeState.canUndo);
+      setLatestUndoTouchesPublicDesktop(organizeState.latestBatchTouchesPublicDesktop);
       setAssistantMessage(result.skippedCount
         ? `已放回 ${result.movedCount} 个项目，另有 ${result.skippedCount} 个因位置变化没有恢复。`
         : `放回来啦，${result.movedCount} 个项目已经回到桌面。`);
@@ -3048,12 +3575,36 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
       setAssistantMessage("这次没有放回来，整理后的文件仍然安全保留。" );
       setOrganizePhase("error");
     }
-  }, [addNotice, loadCommonPrograms, loadFiles, remapFavoriteProgramPaths]);
+  }, [addNotice, loadCommonPrograms, loadFiles, remapFavoriteProgramPaths, setEvolutionMetrics]);
 
-  const handleOrganizeReview = useCallback(async (excludedMoveIds: string[], favoriteMoveIds: string[]) => {
+  const handleUndoFromShortcut = useCallback(async () => {
+    if (!latestUndoTouchesPublicDesktop) {
+      await handleUndoDesktopOrganize();
+      return;
+    }
+    const confirmed = window.confirm(locale === "zh-CN"
+      ? "最近一次整理包含公共桌面项目。放回后会影响所有 Windows 用户，并请求管理员批准。是否继续？"
+      : "The latest batch contains shared desktop items. Restoring them affects every Windows user and requires administrator approval. Continue?");
+    if (!confirmed) return;
+    try {
+      const token = await requestPublicDesktopConfirmation("undo");
+      await handleUndoDesktopOrganize(token);
+    } catch (error) {
+      console.error(error);
+      setAssistantMessage("公共桌面撤销确认没有完成，请重新确认。");
+    }
+  }, [handleUndoDesktopOrganize, latestUndoTouchesPublicDesktop, locale]);
+
+  const handleOrganizeReview = useCallback(async (excludedMoveIds: string[], favoriteMoveIds: string[], confirmationToken?: string) => {
     suppressFileNoticeUntil.current = Date.now() + 2500;
     if (!organizeResult?.batchId) throw new Error("这批整理记录无法复查，请重新整理一次。");
-    const review = await reviewDesktopOrganize(organizeResult.batchId, excludedMoveIds);
+    const review = await reviewDesktopOrganize(organizeResult.batchId, excludedMoveIds, confirmationToken);
+    if (review.restoredCount > 0) {
+      setEvolutionMetrics((current) => ({
+        ...current,
+        organizedFiles: Math.max(0, current.organizedFiles - review.restoredCount),
+      }));
+    }
     const excluded = new Set(excludedMoveIds);
     const favorites = new Set(favoriteMoveIds);
     const items = organizeResult.items ?? [];
@@ -3071,6 +3622,7 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
     }
     const [, , , organizeState] = await Promise.all([loadFiles(), loadCommonPrograms(), loadExclusions(), getOrganizeState()]);
     setCanUndoOrganize(organizeState.canUndo);
+    setLatestUndoTouchesPublicDesktop(organizeState.latestBatchTouchesPublicDesktop);
     setAssistantMessage(review.conflictCount
       ? `已保存复查，但有 ${review.conflictCount} 个项目因重名或位置变化没有放回。`
       : review.rememberedCount
@@ -3084,7 +3636,7 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
       "file",
     );
     return review;
-  }, [addNotice, loadCommonPrograms, loadExclusions, loadFiles, organizeResult, setFavoritePrograms]);
+  }, [addNotice, loadCommonPrograms, loadExclusions, loadFiles, organizeResult, setEvolutionMetrics, setFavoritePrograms]);
 
   useEffect(() => {
     let cleanup: undefined | (() => void);
@@ -3096,7 +3648,10 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
       startDesktopWatcher(),
       loadExclusions(),
       getDesktopIconState().then(setDesktopIconState),
-      getOrganizeState().then((state) => setCanUndoOrganize(state.canUndo)),
+      getOrganizeState().then((state) => {
+        setCanUndoOrganize(state.canUndo);
+        setLatestUndoTouchesPublicDesktop(state.latestBatchTouchesPublicDesktop);
+      }),
     ]).catch(console.error);
     subscribeToFileChanges(() => {
       if (cancelled) return;
@@ -3174,13 +3729,14 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
       userMessage: lastUserMessage,
       reply: assistantMessage || "想让我做什么？",
       listening: isListening,
-      busy: agentTaskRunning,
+      busy: activeConnectorBusy,
       connectorId: agentConnector,
       resultFiles: agentResultFiles,
+      sessions: dialogueSessions,
     };
     dialogueStateRef.current = state;
     if (isTauri()) void publishDialogueState(state).catch(console.error);
-  }, [agentConnector, agentResultFiles, agentTaskRunning, assistantMessage, isListening, lastUserMessage]);
+  }, [activeConnectorBusy, agentConnector, agentResultFiles, assistantMessage, dialogueSessions, isListening, lastUserMessage]);
 
   useEffect(() => {
     if (isTauri()) {
@@ -3209,6 +3765,9 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
     subscribeToPetFeed((result) => {
       suppressFileNoticeUntil.current = Date.now() + 2500;
       setLastFeed(result);
+      if (result.count > 0) {
+        setEvolutionMetrics((current) => ({ ...current, feedCount: current.feedCount + result.count }));
+      }
       addNotice(result.warning ? "喂食未完全成功" : "宠物吃掉了文件", result.warning || `${result.names.slice(0, 2).join("、")} 已送入回收站。`, "file");
       void loadFiles();
     }).then((cleanup) => {
@@ -3218,6 +3777,12 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
     subscribeToPetRestore((result) => {
       suppressFileNoticeUntil.current = Date.now() + 2500;
       setLastFeed(null);
+      if (result.count > 0) {
+        setEvolutionMetrics((current) => ({
+          ...current,
+          feedCount: Math.max(0, current.feedCount - result.count),
+        }));
+      }
       addNotice("已撤销喂食", `${result.names.slice(0, 2).join("、")} 已恢复到原位置。`, "file");
       void loadFiles();
     }).then((cleanup) => {
@@ -3470,7 +4035,16 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
   }, [finishRest, restActive, restSeconds, restStage]);
 
   const toggleTodo = (id: string) => {
-    setTodos((current) => current.map((todo) => todo.id === id ? { ...todo, status: todo.status === "done" ? "pending" : "done" } : todo));
+    const target = todos.find((todo) => todo.id === id);
+    if (!target) return;
+    const completing = target.status !== "done";
+    setTodos((current) => current.map((todo) => todo.id === id
+      ? { ...todo, status: completing ? "done" : "pending" }
+      : todo));
+    setEvolutionMetrics((metrics) => ({
+      ...metrics,
+      completedTodos: Math.max(0, metrics.completedTodos + (completing ? 1 : -1)),
+    }));
   };
 
   const handleTodoAction = (todo: Todo) => {
@@ -3502,51 +4076,64 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
 
   const handleStopAgentTask = useCallback(async () => {
     if (!agentTaskRunning) return;
-    setAssistantMessage("正在温柔停下来…");
+    const taskConnector = agentTaskStatus && isAgentTaskActive(agentTaskStatus)
+      ? agentTaskStatus.connectorId
+      : agentBusyConnector;
+    if (!taskConnector) return;
+    previewSessionAssistantMessage(taskConnector, "正在温柔停下来…");
     setAgentTaskStatus((current) => current ? { ...current, state: "cancelling", cancelRequested: true, updatedAt: Date.now() } : current);
     try {
       const activeTaskId = agentTaskStatus && isAgentTaskActive(agentTaskStatus) ? agentTaskStatus.taskId : undefined;
       const requested = await stopAgentTask(activeTaskId);
-      if (!requested) setAssistantMessage("当前没有可停止的 Agent 任务。");
+      if (!requested) recordSessionAssistantMessage(taskConnector, "当前没有可停止的 Agent 任务。");
     } catch (error) {
       console.error(error);
-      setAssistantMessage("暂时没能停下来，再试一次吧。");
+      recordSessionAssistantMessage(taskConnector, "暂时没能停下来，再试一次吧。");
     }
-  }, [agentTaskRunning, agentTaskStatus]);
+  }, [agentBusyConnector, agentTaskRunning, agentTaskStatus, previewSessionAssistantMessage, recordSessionAssistantMessage]);
 
-  const handleOpenAgentResultFile = useCallback(async (file: AgentResultFile) => {
+  const handleOpenAgentResultFile = useCallback(async (file: AgentResultFile, resultConnector: DialogueConnectorId = agentConnectorRef.current) => {
     try {
-      const workspace = agentWorkspace.trim() || await getAgentDefaultWorkspace();
-      if (!agentWorkspace.trim()) setAgentWorkspace(workspace);
+      const sessionWorkspace = dialogueSessionsRef.current[resultConnector].workspace.trim();
+      const workspace = sessionWorkspace || await getAgentDefaultWorkspace();
+      if (!sessionWorkspace) updateDialogueSession(resultConnector, { workspace });
       await openAgentResultFile(file.path, workspace);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      setAssistantMessage(message || "这个交付文件暂时打不开。");
+      recordSessionAssistantMessage(resultConnector, message || "这个交付文件暂时打不开。");
     }
-  }, [agentWorkspace, setAgentWorkspace]);
+  }, [recordSessionAssistantMessage, updateDialogueSession]);
 
   const handleCommand = useCallback(async ({ text: rawText, connectorId: connectorOverride, attachmentPaths }: DialogueCommand) => {
     const request = rawText.trim();
     if (!request) return;
     const selectedConnector = connectorOverride ?? agentConnector;
     const attachments = Array.isArray(attachmentPaths) ? attachmentPaths : [];
-    if (selectedConnector !== agentConnector) setAgentConnector(selectedConnector);
-    setLastUserMessage(request);
-    setAgentResultFiles([]);
+    const sessionBeforeRequest = dialogueSessionsRef.current[selectedConnector];
+    if (selectedConnector !== agentConnector) {
+      agentConnectorRef.current = selectedConnector;
+      setAgentConnector(selectedConnector);
+    }
+    updateDialogueSession(selectedConnector, (current) => ({
+      ...appendDialogueUserMessage(current, request),
+      draft: "",
+      attachmentPaths: [],
+    }));
+    setEvolutionMetrics((current) => ({ ...current, interactions: current.interactions + 1 }));
     if (dialogueEnabled && !isTauri()) setDialogueOpen(true);
     const text = request.replace(/[，。！？,.!?]/g, " ").replace(/\s+/g, " ");
-    if (/^(不要|别|取消|停止)/.test(text)) {
+    if (/^(?:不要|别|取消|停止|cancel\b|stop\b|never\s*mind\b|do\s+not\b|don't\b)/i.test(text)) {
       if (agentTaskRunning) await handleStopAgentTask();
-      else setAssistantMessage("好，不做。");
+      else recordSessionAssistantMessage(selectedConnector, "好，不做。");
       return;
     }
     if (selectedConnector === "local" && attachments.length) {
-      setAssistantMessage("这些文件需要交给本机 Agent，请先选择 Claude、Hermes 或 Codex。");
+      recordSessionAssistantMessage(selectedConnector, "这些文件需要交给本机 Agent，请先选择 Claude、Hermes 或 Codex。");
       return;
     }
     if (selectedConnector !== "local") {
       if (agentTaskRunning) {
-        setAssistantMessage("上一个任务还在处理，请稍等一下。");
+        recordSessionAssistantMessage(selectedConnector, "上一个任务还在处理，请稍等一下。");
         return;
       }
       let connector = agentConnectors.find((item) => item.id === selectedConnector);
@@ -3560,87 +4147,133 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
         }
       }
       if (!connector || !isAgentConnectorReady(connector)) {
-        setAssistantMessage(connector?.detail || "这个本机 Agent 暂时不可用，请在设置里重新检测。");
+        recordSessionAssistantMessage(selectedConnector, connector?.detail || "这个本机 Agent 暂时不可用，请在设置里重新检测。");
         return;
       }
       setAgentTaskStatus(null);
       setAgentBusy(true);
-      setAssistantMessage(attachments.length ? `正在整理 ${attachments.length} 个附件并启动本机 Agent…` : "正在启动本机 Agent…");
+      setAgentBusyConnector(selectedConnector);
+      updateDialogueSession(selectedConnector, (current) => ({
+        ...setDialogueSessionPreview(current, attachments.length ? `正在整理 ${attachments.length} 个附件并启动本机 Agent…` : "正在启动本机 Agent…"),
+        busy: true,
+        activeTaskId: "pending",
+      }));
       sendMainPetSignal("request_submitted", { source: "agent", payload: { connectorId: selectedConnector, attachmentCount: attachments.length } });
       try {
-        const workspace = agentWorkspace.trim() || await getAgentDefaultWorkspace();
-        if (!agentWorkspace.trim()) setAgentWorkspace(workspace);
+        const workspace = sessionBeforeRequest.workspace.trim() || await getAgentDefaultWorkspace();
+        updateDialogueSession(selectedConnector, { workspace });
         agentInvokeOwnedRef.current = true;
-        const result = await runAgentTask(selectedConnector, request, workspace, attachments);
+        const contextualTask = buildProviderTaskWithHistory(sessionBeforeRequest, request);
+        const result = await runAgentTask(
+          selectedConnector,
+          contextualTask,
+          workspace,
+          attachments,
+          sessionBeforeRequest.appSessionId,
+          sessionBeforeRequest.providerSessionId,
+        );
         lastDeliveredAgentTaskIdRef.current = result.taskId;
         setLastDeliveredAgentTaskId(result.taskId);
-        setAgentResultFiles(result.files ?? []);
         const finalOutput = result.output.trim();
         if (result.success) {
-          setAssistantMessage(finalOutput || "任务完成啦。");
+          updateDialogueSession(selectedConnector, (current) => ({
+            ...appendDialogueAssistantMessage(current, finalOutput || "任务完成啦。", result.files ?? [], result.taskId),
+            providerSessionId: result.failureCode === "session_not_found" ? null : result.providerSessionId ?? current.providerSessionId,
+            busy: false,
+            activeTaskId: null,
+          }));
+          setEvolutionMetrics((current) => ({ ...current, agentSuccesses: current.agentSuccesses + 1 }));
           sendMainPetSignal("task_completed", { source: "agent", payload: { connectorId: selectedConnector, durationMs: result.durationMs } });
           addNotice(`${connector.name} 已完成任务`, result.truncated ? "结果较长，已显示可用部分。" : "结果已经送回宠物对话。", "action");
         } else if (result.cancelled) {
-          setAssistantMessage("任务已经停下来了。");
+          updateDialogueSession(selectedConnector, (current) => ({
+            ...appendDialogueAssistantMessage(current, "任务已经停下来了。", result.files ?? [], result.taskId),
+            providerSessionId: result.failureCode === "session_not_found" ? null : result.providerSessionId ?? current.providerSessionId,
+            busy: false,
+            activeTaskId: null,
+          }));
           sendMainPetSignal("task_failed", { source: "agent", payload: { connectorId: selectedConnector, cancelled: true } });
           addNotice(`${connector.name} 已停止`, "任务已按你的要求安全停止。", "action");
         } else {
-          setAssistantMessage(finalOutput || (result.timedOut ? "任务运行时间过长，已经安全停止。" : "任务没有完成，请换一种说法再试。"));
+          updateDialogueSession(selectedConnector, (current) => ({
+            ...appendDialogueAssistantMessage(current, finalOutput || (result.timedOut ? "任务运行时间过长，已经安全停止。" : "任务没有完成，请换一种说法再试。"), result.files ?? [], result.taskId),
+            providerSessionId: result.failureCode === "session_not_found" ? null : result.providerSessionId ?? current.providerSessionId,
+            busy: false,
+            activeTaskId: null,
+          }));
           sendMainPetSignal("task_failed", { source: "agent", payload: { connectorId: selectedConnector, timedOut: result.timedOut } });
           addNotice(`${connector.name} 未完成任务`, result.timedOut ? "任务运行时间过长，已安全停止。" : "请打开宠物对话查看结果。", "action");
         }
       } catch (error) {
         console.error(error);
         const message = error instanceof Error ? error.message : String(error);
-        setAssistantMessage(message || "任务没有完成，请稍后再试。");
+        updateDialogueSession(selectedConnector, (current) => ({
+          ...appendDialogueAssistantMessage(current, message || "任务没有完成，请稍后再试。"),
+          busy: false,
+          activeTaskId: null,
+        }));
         sendMainPetSignal("task_failed", { source: "agent", payload: { connectorId: selectedConnector, error: message } });
       } finally {
         agentInvokeOwnedRef.current = false;
         setAgentBusy(false);
+        setAgentBusyConnector(null);
       }
       return;
     }
     sendMainPetSignal("request_submitted", { source: "system", payload: { local: true } });
-    if (/(撤销|恢复|放回).*(整理|桌面)/.test(text)) {
-      await handleUndoDesktopOrganize();
+    if (/(撤销|恢复|放回).*(整理|桌面)/.test(text)
+      || /\b(?:undo|restore|put\s+back)\b.*\b(?:desktop|organization|organizing|organize)\b/i.test(text)) {
+      await handleUndoFromShortcut();
       sendMainPetSignal("task_completed", { source: "system" });
       return;
     }
-    if (/(一键整理|整理桌面|收拾桌面|清理桌面)/.test(text)) {
+    if (/(一键整理|整理桌面|收拾桌面|清理桌面)/.test(text)
+      || /\b(?:organize|tidy|sort|clean\s+up)\b\s+(?:(?:my|the)\s+)?desktop\b/i.test(text)) {
       await handleOrganizeDesktop();
       sendMainPetSignal("task_completed", { source: "system" });
       return;
     }
-    const ideaMatch = text.match(/(?:记录|记下|记一下)(?:一个)?(?:意见|想法|灵感)?\s*(.+)/);
+    const ideaMatch = text.match(/(?:记录|记下|记一下)(?:一个)?(?:意见|想法|灵感)?\s*(.+)/)
+      ?? text.match(/^(?:record|save|capture|add)\s+(?:an?\s+)?(?:idea|note)\s*[:：-]?\s*(.+)$/i);
     if (ideaMatch?.[1]) {
       addIdea(ideaMatch[1], "voice");
       sendMainPetSignal("task_completed", { source: "system" });
       return;
     }
-    const todoMatch = text.match(/(?:新增|添加|创建)(?:一个)?待办\s*(.+)/);
+    const todoMatch = text.match(/(?:新增|添加|创建)(?:一个)?待办\s*(.+)/)
+      ?? text.match(/^(?:add|create|record)\s+(?:an?\s+)?(?:todo|to-do|task)\s*[:：-]?\s*(.+)$/i);
     if (todoMatch?.[1]) {
       addTodo(todoMatch[1]);
       sendMainPetSignal("task_completed", { source: "system" });
       return;
     }
     const explicitWeb = /(发布页|创作中心|网页|网站|发布图文|发布视频)/.test(text);
-    if (/小红书|红薯|xhs/i.test(text) && (explicitWeb || /^发布/.test(text))) {
+    if (/小红书|红薯|xhs|xiaohongshu|rednote/i.test(text)
+      && (explicitWeb || /^发布/.test(text) || /\b(?:open|publish|post|creator|studio)\b/i.test(text))) {
       await openSocial("xiaohongshu");
       sendMainPetSignal("task_completed", { source: "system" });
       return;
     }
-    if (/(发布到|打开)\s*x\b/i.test(text)) {
+    if (/(发布到|打开)\s*x\b/i.test(text)
+      || /\b(?:open|publish|post)\b.*\b(?:x|twitter)\b/i.test(text)
+      || /\b(?:x|twitter)\b.*\b(?:open|publish|post)\b/i.test(text)) {
       await openSocial("x");
       sendMainPetSignal("task_completed", { source: "system" });
       return;
     }
-    if (/抖音/.test(text) && /(发布|打开|创作)/.test(text)) {
+    if (/抖音|douyin/i.test(text) && /(发布|打开|创作|\bopen\b|\bpublish\b|\bpost\b|\bcreator\b)/i.test(text)) {
       await openSocial("douyin");
       sendMainPetSignal("task_completed", { source: "system" });
       return;
     }
-    if (/(打开|找|查找|搜索|查看)/.test(text)) {
-      const keyword = text.replace(/^(帮我|请|麻烦)?\s*/, "").replace(/(打开|找一下|找|查找|搜索|查看)/g, "").replace(/(桌面上的?|桌面的?|文件|程序|软件|应用|一下|那个)/g, "").trim();
+    if (/(打开|找|查找|搜索|查看)/.test(text)
+      || /\b(?:open|find|locate|view|show|search)\b/i.test(text)) {
+      const keyword = text
+        .replace(/^(?:帮我|请|麻烦|please|could\s+you|can\s+you|would\s+you)\s*/i, "")
+        .replace(/(?:打开|找一下|找|查找|搜索|查看|\bsearch(?:\s+for)?\b|\bopen\b|\bfind\b|\blocate\b|\bview\b|\bshow\b)/gi, " ")
+        .replace(/(?:桌面上的?|桌面的?|文件|程序|软件|应用|一下|那个|\b(?:on\s+)?(?:(?:my|the)\s+)?desktop\b|\b(?:file|program|software|app|application)\b|\bplease\b)/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
       const fileCandidates = rankFiles(files, keyword).map((candidate) => ({ ...candidate, kind: "file" as const }));
       const programCandidates = rankPrograms(commonPrograms, keyword).map((candidate) => ({ ...candidate, kind: "program" as const }));
       const candidatesByPath = new Map<string, (typeof fileCandidates)[number] | (typeof programCandidates)[number]>();
@@ -3667,12 +4300,17 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
     }
     setAssistantMessage("这件事我还不会，换句话试试吧。");
     sendMainPetSignal("task_failed", { source: "system" });
-  }, [addIdea, addNotice, addTodo, agentConnector, agentConnectors, agentTaskRunning, agentWorkspace, commonPrograms, dialogueEnabled, files, handleLaunchProgram, handleOrganizeDesktop, handleStopAgentTask, handleUndoDesktopOrganize, openIndexedItem, openSocial, sendMainPetSignal, setAgentConnector, setAgentWorkspace, setLastDeliveredAgentTaskId]);
+  }, [addIdea, addNotice, addTodo, agentConnector, agentConnectors, agentTaskRunning, commonPrograms, dialogueEnabled, files, handleLaunchProgram, handleOrganizeDesktop, handleStopAgentTask, handleUndoFromShortcut, openIndexedItem, openSocial, sendMainPetSignal, setAgentConnector, setLastDeliveredAgentTaskId]);
 
   useEffect(() => {
     let cleanup: undefined | (() => void);
     let cancelled = false;
-    subscribeToDialogueCommand((command) => void handleCommand(command)).then((unlisten) => {
+    subscribeToDialogueCommand((command) => {
+      if (command.commandId) {
+        void acknowledgeDialogueCommand({ commandId: command.commandId, accepted: true }).catch(console.error);
+      }
+      void handleCommand(command);
+    }).then((unlisten) => {
       if (cancelled) unlisten();
       else cleanup = unlisten;
     }).catch(console.error);
@@ -3799,7 +4437,8 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
         petName={petName || "派派"}
         species={petSpecies}
         theme={petTheme}
-        evolution={evolution}
+        evolution={effectiveEvolution}
+        evolutionStage={effectiveEvolutionStage}
         stage={restStage}
         onRequestExit={finishRest}
         onStageComplete={handleRestStageComplete}
@@ -3816,6 +4455,8 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
             <PetSprite
               species={petSpecies}
               action={petRuntimeSnapshot.actionId as PetSpriteAction}
+              evolutionStage={effectiveEvolutionStage}
+              evolutionPath={effectiveEvolution}
               motionMode={petRuntimeSnapshot.behaviorMode}
               actionInstanceId={petRuntimeSnapshot.actionInstanceId}
               startedAtEpochMs={petRuntimeSnapshot.startedAtEpochMs}
@@ -3853,7 +4494,8 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
                       name={petName || "派派"}
                       species={petSpecies}
                       theme={petTheme}
-                      evolution={evolution}
+                      evolution={effectiveEvolution}
+                      evolutionStage={effectiveEvolutionStage}
                       motionMode={petMotionMode}
                       message={assistantMessage}
                       pendingCount={pendingTodos}
@@ -3888,7 +4530,7 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
                       onRefresh={() => void loadFiles(true)}
                       onRefreshPrograms={() => void loadCommonPrograms()}
                       onOrganize={() => void handleOrganizeDesktop()}
-                      onUndoOrganize={() => void handleUndoDesktopOrganize()}
+                      onUndoOrganize={() => void handleUndoFromShortcut()}
                       onOpen={(file) => { setLastUserMessage(`打开「${file.name}」`); void openIndexedItem(file); }}
                       onLaunchProgram={(program) => void handleLaunchProgram(program)}
                       onRemoveProgram={handleRemoveFavoriteProgram}
@@ -3968,9 +4610,43 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
         {socialSettingsOpen ? (
           <SocialSettingsSheet
             shortcuts={customSocialShortcuts}
+            accounts={socialAccounts}
+            loading={socialAccountsLoading}
             onAdd={(name, url) => setCustomSocialShortcuts((current) => [...current, { id: makeId("social"), name, url }])}
             onRemove={(id) => setCustomSocialShortcuts((current) => current.filter((shortcut) => shortcut.id !== id))}
             onOpen={(shortcut) => void openCustomSocial(shortcut)}
+            onConnect={async (platform) => {
+              await openSocialSession(platform);
+              addNotice(`${platformNames[platform]} 登录窗口已打开`, "请在 Edge 完成登录，再回到这里同步并验证账号。登录态由 Edge Profile 保存。", "action");
+            }}
+            onSyncSnapshot={async (platform) => {
+              try {
+                const saved = await syncSocialSnapshot(platform);
+                setSocialAccounts((items) => [...items.filter((item) => item.platform !== saved.platform), saved]);
+                addNotice(`${platformNames[platform]} 汇总已同步`, "只读取了当前页面可见的账号名称和汇总数字，没有读取私信正文或原始 Cookie。", "action");
+                return saved;
+              } catch (error) {
+                const latest = await listSocialAccounts().catch(() => []);
+                if (latest.length) setSocialAccounts(latest);
+                throw error;
+              }
+            }}
+            onSaveSnapshot={async (snapshot) => {
+              const saved = await saveSocialSnapshot(snapshot);
+              setSocialAccounts((items) => [...items.filter((item) => item.platform !== saved.platform), saved]);
+            }}
+            onDisconnect={async (platform) => {
+              await disconnectSocialSession(platform);
+              const latest = await listSocialAccounts();
+              setSocialAccounts(latest);
+              addNotice(`${platformNames[platform]} 窗口已断开`, "Edge Profile 仍保留，下次打开可继续使用登录状态。", "action");
+            }}
+            onClear={async (platform) => {
+              await clearSocialSession(platform);
+              const latest = await listSocialAccounts();
+              setSocialAccounts(latest);
+              addNotice(`${platformNames[platform]} 登录资料已清除`, "该平台的本地 Edge Profile 与汇总快照已删除。", "action");
+            }}
             onClose={() => setSocialSettingsOpen(false)}
           />
         ) : null}
@@ -3995,7 +4671,13 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
             name={petName}
             species={petSpecies}
             theme={petTheme}
-            evolution={evolution}
+            evolution={effectiveEvolution}
+            autoEvolution={autoEvolution}
+            manualEvolutionStage={manualEvolutionStage}
+            evolutionStage={effectiveEvolutionStage}
+            evolutionPoints={evolutionState.points}
+            evolutionStagePoints={evolutionState.stagePoints}
+            evolutionStageSpan={evolutionState.stageSpan}
             motionMode={petMotionMode}
             visible={petVisible}
             layer={petLayer}
@@ -4006,12 +4688,14 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
             connectors={agentConnectors}
             connectorsLoading={agentConnectorsLoading}
             connectorScanMessage={agentConnectorScanMessage}
-            agentWorkspace={agentWorkspace}
+            agentWorkspace={activeAgentWorkspace}
             lastFeed={lastFeed}
             onName={setPetName}
             onSpecies={setPetSpecies}
             onTheme={setPetTheme}
             onEvolution={setEvolution}
+            onEvolutionStage={setManualEvolutionStage}
+            onAutoEvolution={setAutoEvolution}
             onMotionMode={setPetMotionMode}
             onVisible={setPetVisible}
             onLayer={setPetLayerState}
@@ -4027,7 +4711,7 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
             }}
             onVoiceEnabled={setVoiceEnabled}
             onConnector={setAgentConnector}
-            onAgentWorkspace={setAgentWorkspace}
+            onAgentWorkspace={updateActiveAgentWorkspace}
             onRefreshConnectors={() => void refreshAgentConnectors()}
             onUndoFeed={() => void handleUndoFeed()}
             onClose={() => setPetSettingsOpen(false)}
@@ -4050,10 +4734,12 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
           organizedTotal={libraryFileCount}
           desktopIconState={desktopIconState}
           onClose={() => setOrganizePhase("idle")}
-          onUndo={() => void handleUndoDesktopOrganize()}
+          onUndo={(confirmationToken) => void handleUndoDesktopOrganize(confirmationToken)}
           onReview={handleOrganizeReview}
+          onRequestPublicConfirmation={requestPublicDesktopConfirmation}
           onOpenExclusions={openExclusions}
           onToggleDesktopIcons={handleToggleDesktopIcons}
+          onOrganizePublicDesktop={(confirmationToken) => handleOrganizeDesktop(true, confirmationToken)}
         />
 
         <MinimalDialogue
@@ -4061,13 +4747,16 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
           petName={petName || "派派"}
           userMessage={lastUserMessage}
           reply={assistantMessage}
+          messages={activeDialogueSession.messages}
+          draft={activeDialogueSession.draft}
+          attachmentPaths={activeDialogueSession.attachmentPaths}
           voiceEnabled={voiceEnabled}
           isListening={isListening}
-          busy={agentTaskRunning}
+          busy={activeConnectorBusy}
           busyElapsedMs={agentTaskTiming.elapsedMs}
           busyHeartbeatKnown={agentTaskTiming.heartbeatKnown}
           busyHeartbeatFresh={agentTaskTiming.heartbeatFresh}
-          busyCancelling={agentTaskStatus?.state === "cancelling" || agentTaskStatus?.cancelRequested === true}
+          busyCancelling={agentTaskStatus?.connectorId === agentConnector && (agentTaskStatus.state === "cancelling" || agentTaskStatus.cancelRequested === true)}
           connectorId={agentConnector}
           connectors={agentConnectors}
           resultFiles={agentResultFiles}
@@ -4075,8 +4764,12 @@ function WidgetApplication({ locale, onLocale }: { locale: AppLocale; onLocale: 
           onSubmit={(submission) => { void handleCommand({ ...submission, connectorId: agentConnector }); }}
           onMic={handleMic}
           onConnector={setAgentConnector}
+          onDraftChange={(draft) => updateDialogueSession(agentConnector, { draft })}
+          onAttachmentPathsChange={(next) => updateDialogueSession(agentConnector, (current) => ({
+            attachmentPaths: typeof next === "function" ? next(current.attachmentPaths) : next,
+          }))}
           onOpenResultFile={handleOpenAgentResultFile}
-          onStop={agentTaskRunning ? () => void handleStopAgentTask() : undefined}
+          onStop={activeConnectorBusy ? () => void handleStopAgentTask() : undefined}
         />
       </main>
     </div>
@@ -4087,6 +4780,44 @@ function App() {
   const windowKind = new URLSearchParams(window.location.search).get("window");
   const [locale, setLocale] = usePersistentState<AppLocale>("wormhole-pie.locale.v1", "zh-CN");
   useDocumentLanguage(locale);
+
+  useEffect(() => {
+    const title = locale === "zh-CN"
+      ? windowKind === "pet"
+        ? "虫洞派 · 宠物"
+        : windowKind === "dialogue" || windowKind === "pet-dialogue"
+          ? "虫洞派 · 对话"
+          : "虫洞派"
+      : windowKind === "pet"
+        ? "Wormhole Pie · Pet"
+        : windowKind === "dialogue" || windowKind === "pet-dialogue"
+          ? "Wormhole Pie · Dialogue"
+          : "Wormhole Pie";
+    document.title = title;
+    if (!isTauri()) return;
+    let cancelled = false;
+    void import("@tauri-apps/api/window")
+      .then(({ getCurrentWindow }) => cancelled ? undefined : getCurrentWindow().setTitle(title))
+      .catch(console.error);
+    return () => { cancelled = true; };
+  }, [locale, windowKind]);
+
+  useEffect(() => {
+    void setAppLocale(locale).catch(console.error);
+  }, [locale]);
+
+  useEffect(() => {
+    let cleanup: undefined | (() => void);
+    let cancelled = false;
+    void subscribeToAppLocale((nextLocale) => setLocale((current) => current === nextLocale ? current : nextLocale)).then((unlisten) => {
+      if (cancelled) unlisten();
+      else cleanup = unlisten;
+    }).catch(console.error);
+    return () => {
+      cancelled = true;
+      cleanup?.();
+    };
+  }, [setLocale]);
 
   useEffect(() => {
     if (!isTauri()) return;

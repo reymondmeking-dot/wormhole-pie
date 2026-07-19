@@ -1,7 +1,8 @@
 import { memo, useEffect, useRef, useState } from "react";
 import type { CSSProperties, SyntheticEvent } from "react";
 import { petMotionProfiles } from "../petProfile";
-import type { PetMotionMode, PetSpecies } from "../petProfile";
+import type { EvolutionPath, EvolutionStage, PetMotionMode, PetSpecies } from "../petProfile";
+import blenderMotionMap from "./blenderMotionMap.json";
 import {
   getPetActionDefinition,
   getPetFrameSrc,
@@ -45,6 +46,8 @@ export type PetPlaybackState = Readonly<{
 export type PetSpriteProps = {
   species: PetSpecies;
   action: PetSpriteAction;
+  evolutionStage?: EvolutionStage;
+  evolutionPath?: EvolutionPath;
   className?: string;
   lookX?: number;
   lookY?: number;
@@ -79,11 +82,35 @@ type InstanceClock = {
 
 type ImageFallback = {
   imageKey: string;
-  stage: 0 | 1 | 2 | 3;
+  stage: number;
 };
 
 const TRANSPARENT_PIXEL = "data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=";
+const blenderPetAssetRoot = `${import.meta.env.BASE_URL.replace(/\/?$/, "/")}pets/blender-rendered`;
+const blenderSpeciesAliases = blenderMotionMap.speciesAliases as Readonly<Record<string, string>>;
+const blenderMotionFamilyByAction = blenderMotionMap.actions as Readonly<Record<PetSpriteAction, string>>;
 let generatedIdCounter = 0;
+
+export function getBlenderPetFrameSrc(
+  species: PetSpecies,
+  evolutionStage: EvolutionStage,
+  evolutionPath: EvolutionPath,
+  action: PetSpriteAction,
+  frame: number,
+) {
+  const renderedSpecies = blenderSpeciesAliases[species] ?? species;
+  const motionFamily = blenderMotionFamilyByAction[action] ?? "idle";
+  const renderedFrame = String(((Math.max(1, frame) - 1) % blenderMotionMap.render.frameCount) + 1).padStart(2, "0");
+  return `${blenderPetAssetRoot}/${renderedSpecies}/${evolutionStage}/${evolutionPath}/${motionFamily}/${renderedFrame}.png`;
+}
+
+export function getBlenderPetPreviewSrc(
+  species: PetSpecies,
+  evolutionStage: EvolutionStage,
+  evolutionPath: EvolutionPath,
+) {
+  return getBlenderPetFrameSrc(species, evolutionStage, evolutionPath, "idle_breathe", 1);
+}
 
 function createRuntimeId(prefix: string) {
   const randomUuid = globalThis.crypto?.randomUUID?.();
@@ -432,6 +459,8 @@ function nextFrameDelay(
 export const PetSprite = memo(function PetSprite({
   species,
   action,
+  evolutionStage = "seedling",
+  evolutionPath = "companion",
   className = "",
   lookX = 0,
   lookY = 0,
@@ -519,11 +548,13 @@ export const PetSprite = memo(function PetSprite({
     const frames = new Set([...definition.entrySequence, ...definition.sequence]);
     for (const frame of frames) {
       const image = new Image();
-      image.src = getPetFrameSrc(species, resolvedAction, frame, manifestIndex);
+      image.src = getBlenderPetFrameSrc(species, evolutionStage, evolutionPath, resolvedAction, frame);
+      const fallbackImage = new Image();
+      fallbackImage.src = getPetFrameSrc(species, resolvedAction, frame, manifestIndex);
     }
     const idleImage = new Image();
-    idleImage.src = getPetFrameSrc(species, "idle_breathe", 1, manifestIndex);
-  }, [definition, manifestIndex, resolvedAction, species]);
+    idleImage.src = getBlenderPetFrameSrc(species, evolutionStage, evolutionPath, "idle_breathe", 1);
+  }, [definition, evolutionPath, evolutionStage, manifestIndex, resolvedAction, species]);
 
   useEffect(() => {
     let disposed = false;
@@ -621,22 +652,29 @@ export const PetSprite = memo(function PetSprite({
     "--pet-gaze-y": `${clampedLookY * 1.8}px`,
   } as CSSProperties;
 
-  const imageKey = `${playbackKey}:${species}`;
+  const imageKey = `${playbackKey}:${species}:${evolutionStage}:${evolutionPath}`;
   const fallbackStage = imageFallback.imageKey === imageKey ? imageFallback.stage : 0;
-  const imageSrc = fallbackStage === 0
-    ? getPetFrameSrc(species, resolvedAction, activePlayback.frameNumber, manifestIndex)
-    : fallbackStage === 1
-      ? getPetFrameSrc(species, "idle_breathe", activePlayback.frameNumber, manifestIndex)
-      : fallbackStage === 2
-        ? getPetFrameSrc("star-cat", "idle_breathe", activePlayback.frameNumber, manifestIndex)
-        : TRANSPARENT_PIXEL;
+  const renderedFrame = String(((activePlayback.frameNumber - 1) % 4) + 1).padStart(2, "0");
+  const renderedSpecies = blenderSpeciesAliases[species] ?? species;
+  const motionFamily = blenderMotionFamilyByAction[resolvedAction] ?? "idle";
+  const candidateSources = Array.from(new Set([
+    getBlenderPetFrameSrc(species, evolutionStage, evolutionPath, resolvedAction, activePlayback.frameNumber),
+    getBlenderPetFrameSrc(species, evolutionStage, "companion", resolvedAction, activePlayback.frameNumber),
+    getBlenderPetFrameSrc(species, evolutionStage, "companion", "idle_breathe", activePlayback.frameNumber),
+    `${blenderPetAssetRoot}/${renderedSpecies}/${evolutionStage}/${renderedFrame}.png`,
+    getPetFrameSrc(species, resolvedAction, activePlayback.frameNumber, manifestIndex),
+    getPetFrameSrc(species, "idle_breathe", activePlayback.frameNumber, manifestIndex),
+    getPetFrameSrc("star-cat", "idle_breathe", activePlayback.frameNumber, manifestIndex),
+    TRANSPARENT_PIXEL,
+  ]));
+  const imageSrc = candidateSources[Math.min(fallbackStage, candidateSources.length - 1)];
 
   const handleImageError = (event: SyntheticEvent<HTMLImageElement>) => {
-    if (fallbackStage >= 3) {
+    if (fallbackStage >= candidateSources.length - 1) {
       event.currentTarget.onerror = null;
       return;
     }
-    setImageFallback({ imageKey, stage: (fallbackStage + 1) as ImageFallback["stage"] });
+    setImageFallback({ imageKey, stage: fallbackStage + 1 });
   };
 
   return (
@@ -646,6 +684,9 @@ export const PetSprite = memo(function PetSprite({
       data-rendered-action={resolvedAction}
       data-frame={activePlayback.frameNumber}
       data-species={species}
+      data-motion-family={motionFamily}
+      data-evolution-stage={evolutionStage}
+      data-evolution-path={evolutionPath}
       data-action-instance-id={activePlayback.actionInstanceId}
       data-sequence-index={activePlayback.sequenceIndex}
       data-loop-count={activePlayback.loopCount}

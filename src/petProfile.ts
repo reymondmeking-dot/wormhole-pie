@@ -1,7 +1,93 @@
 export type PetSpecies = "star-cat" | "moon-rabbit" | "corgi" | "river-otter" | "bear-cub" | "cloud-fox";
 export type PetTheme = "lilac" | "mint" | "peach";
 export type EvolutionPath = "companion" | "creator" | "guardian";
+export type EvolutionStage = "seedling" | "growing" | "evolved";
 export type PetMotionMode = "gentle" | "quiet" | "lively";
+
+export type PetEvolutionMetrics = {
+  completedTodos: number;
+  organizedFiles: number;
+  agentSuccesses: number;
+  interactions: number;
+  feedCount: number;
+  activeDays: string[];
+};
+
+export const defaultPetEvolutionMetrics: PetEvolutionMetrics = {
+  completedTodos: 0,
+  organizedFiles: 0,
+  agentSuccesses: 0,
+  interactions: 0,
+  feedCount: 0,
+  activeDays: [],
+};
+
+export const evolutionStageThresholds = {
+  growing: 35,
+  evolved: 120,
+} as const;
+
+function safeMetric(value: number) {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+export function normalizePetEvolutionMetrics(value: unknown): PetEvolutionMetrics {
+  const saved = typeof value === "object" && value !== null ? value as Partial<PetEvolutionMetrics> : {};
+  return {
+    completedTodos: safeMetric(saved.completedTodos ?? 0),
+    organizedFiles: safeMetric(saved.organizedFiles ?? 0),
+    agentSuccesses: safeMetric(saved.agentSuccesses ?? 0),
+    interactions: safeMetric(saved.interactions ?? 0),
+    feedCount: safeMetric(saved.feedCount ?? 0),
+    activeDays: Array.isArray(saved.activeDays)
+      ? [...new Set(saved.activeDays.filter((day): day is string => typeof day === "string" && Boolean(day.trim())).map((day) => day.trim()))]
+      : [],
+  };
+}
+
+export function mergePetEvolutionMetrics(_current: PetEvolutionMetrics, incoming: PetEvolutionMetrics) {
+  return normalizePetEvolutionMetrics(incoming);
+}
+
+export function calculatePetEvolution(metrics: PetEvolutionMetrics) {
+  const normalized = normalizePetEvolutionMetrics(metrics);
+  const completedTodos = normalized.completedTodos;
+  const organizedFiles = normalized.organizedFiles;
+  const agentSuccesses = normalized.agentSuccesses;
+  const interactions = normalized.interactions;
+  const feedCount = normalized.feedCount;
+  const activeDays = new Set(normalized.activeDays).size;
+  const scores: Record<EvolutionPath, number> = {
+    companion: interactions * 2 + feedCount * 3 + activeDays * 2,
+    creator: agentSuccesses * 5 + interactions + activeDays,
+    guardian: organizedFiles + completedTodos * 4 + activeDays * 2,
+  };
+  const path = (Object.entries(scores) as Array<[EvolutionPath, number]>).sort((left, right) => right[1] - left[1])[0][0];
+  const points = completedTodos * 4 + organizedFiles + agentSuccesses * 5
+    + interactions + feedCount * 3 + activeDays * 2;
+  const stage: EvolutionStage = points >= evolutionStageThresholds.evolved
+    ? "evolved"
+    : points >= evolutionStageThresholds.growing
+      ? "growing"
+      : "seedling";
+  const stageStart = stage === "seedling" ? 0 : stage === "growing" ? evolutionStageThresholds.growing : evolutionStageThresholds.evolved;
+  const nextTarget = stage === "seedling"
+    ? evolutionStageThresholds.growing
+    : evolutionStageThresholds.evolved;
+  const stageSpan = stage === "evolved" ? 1 : nextTarget - stageStart;
+  const stagePoints = stage === "evolved" ? 1 : Math.min(stageSpan, Math.max(0, points - stageStart));
+  return {
+    path,
+    stage,
+    points,
+    nextTarget,
+    stageStart,
+    stagePoints,
+    stageSpan,
+    stageProgress: stagePoints / stageSpan,
+    scores,
+  };
+}
 
 export type PetMotionProfile = Readonly<{
   autonomyIntervalMs: readonly [number, number] | null;
@@ -35,6 +121,12 @@ export const evolutionPathOptions: Array<{ value: EvolutionPath; label: string; 
   { value: "guardian", label: "守护系", detail: "更多整理与专注动作" },
 ];
 
+export const evolutionStageOptions: Array<{ value: EvolutionStage; label: string; detail: string }> = [
+  { value: "seedling", label: "幼苗", detail: "基础外观与轻量动作" },
+  { value: "growing", label: "成长", detail: "轮廓、配饰与动作增强" },
+  { value: "evolved", label: "进化", detail: "完整路线外观与动作表现" },
+];
+
 export const evolutionBadges: Record<EvolutionPath, string> = {
   companion: "伴",
   creator: "灵",
@@ -63,6 +155,9 @@ export const petStorageKeys = {
   species: "wormhole-pie.pet.species.v1",
   theme: "wormhole-pie.pet.theme.v1",
   evolution: "wormhole-pie.pet.evolution.v1",
+  autoEvolution: "wormhole-pie.pet.autoEvolution.v1",
+  manualEvolutionStage: "wormhole-pie.pet.manualEvolutionStage.v1",
+  evolutionMetrics: "wormhole-pie.pet.evolutionMetrics.v1",
   motionMode: "wormhole-pie.pet.motionMode.v1",
   dialogueEnabled: "wormhole-pie.dialogue.enabled.v1",
   voiceEnabled: "wormhole-pie.voice.enabled.v1",

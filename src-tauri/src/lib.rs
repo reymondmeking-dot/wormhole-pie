@@ -1,6 +1,8 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{OsStr, OsString},
@@ -24,9 +26,53 @@ use tauri::{
 use tauri_plugin_dialog::DialogExt;
 
 #[cfg(windows)]
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+#[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::{
+    io::{BufRead, BufReader, Write},
+    os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle},
+};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{
+        SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    },
+    Security::SECURITY_ATTRIBUTES,
+    Storage::FileSystem::{
+        CreateFileW, FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+        SetFileAttributesW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+        OPEN_EXISTING,
+    },
+    System::{
+        Com::CoTaskMemFree,
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+        Pipes::CreatePipe,
+        Threading::{
+            CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess,
+            WaitForSingleObject, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOW,
+        },
+    },
+    UI::{
+        Shell::{
+            FOLDERID_Documents, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX64,
+            FOLDERID_ProgramFilesX86, FOLDERID_PublicDesktop, SHGetKnownFolderPath,
+            ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+        },
+        WindowsAndMessaging::SW_SHOWNORMAL,
+    },
+};
 
 const LIBRARY_ROOT_NAME: &str = "虫洞派资料库";
 const LEGACY_ORGANIZE_ROOT_NAME: &str = "虫洞派整理";
@@ -58,11 +104,34 @@ const AGENT_ATTACHMENT_MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const AGENT_ATTACHMENT_DATA_DIR: &str = ".wormhole-pie";
 const AGENT_ATTACHMENT_INPUT_DIR: &str = "agent-input";
 const AGENT_RESULT_MAX_FILES: usize = 12;
+#[cfg(windows)]
+const SOCIAL_CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(windows)]
+const SOCIAL_CDP_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+#[cfg(windows)]
+const SOCIAL_EDGE_SHUTDOWN_TIMEOUT_MS: u32 = 5_000;
+#[cfg(windows)]
+const ELEVATED_FILE_PLAN_ARG: &str = "--elevated-file-plan";
+#[cfg(windows)]
+const ELEVATED_FILE_PLAN_VERSION: u8 = 2;
+#[cfg(windows)]
+const ELEVATED_FILE_PLAN_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(windows)]
+const PUBLIC_DESKTOP_CONFIRMATION_TTL: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+const PUBLIC_DESKTOP_ACTION_ORGANIZE: &str = "organize";
+#[cfg(windows)]
+const PUBLIC_DESKTOP_ACTION_REVIEW: &str = "review";
+#[cfg(windows)]
+const PUBLIC_DESKTOP_ACTION_UNDO: &str = "undo";
 static AGENT_TASK_LOCK: Mutex<()> = Mutex::new(());
 static ACTIVE_AGENT_TASK: Mutex<Option<ActiveAgentTask>> = Mutex::new(None);
 static LAST_AGENT_TASK_STATUS: Mutex<Option<AgentTaskStatus>> = Mutex::new(None);
 static LAST_AGENT_TASK_RESULT: Mutex<Option<AgentTaskResult>> = Mutex::new(None);
 static AGENT_TASK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(windows)]
+static PUBLIC_DESKTOP_CONFIRMATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static APP_LOCALE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new("zh-CN".to_string()));
 static AGENT_CONNECTOR_CACHE: LazyLock<(Mutex<AgentConnectorCacheState>, Condvar)> =
     LazyLock::new(|| {
         (
@@ -90,6 +159,20 @@ struct AppState {
     last_feed: Mutex<Vec<PathBuf>>,
     organize_batches: Mutex<Vec<DesktopOrganizeBatch>>,
     organize_lock: Arc<Mutex<()>>,
+    #[cfg(windows)]
+    public_desktop_confirmations: Mutex<BTreeMap<String, PublicDesktopConfirmation>>,
+    #[cfg(windows)]
+    social_sessions: Mutex<BTreeMap<String, ManagedSocialSession>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicDesktopConfirmation {
+    action: String,
+    batch_id: Option<String>,
+    move_ids: Vec<String>,
+    organize_snapshot_digest: Option<String>,
+    expires_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,6 +189,67 @@ struct DesktopFile {
     created_at: u64,
     modified_at: u64,
     is_new: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SocialAccountSnapshot {
+    platform: String,
+    display_name: String,
+    followers: u64,
+    unread_messages: u64,
+    unread_notifications: u64,
+    #[serde(default)]
+    followers_source: String,
+    #[serde(default)]
+    unread_messages_source: String,
+    #[serde(default)]
+    unread_notifications_source: String,
+    #[serde(default)]
+    account_identity: String,
+    connected: bool,
+    updated_at: u64,
+    #[serde(default = "social_session_persistence")]
+    session_persistence: String,
+    #[serde(default)]
+    raw_cookie_accessed: bool,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdpTargetInfo {
+    target_id: String,
+    #[serde(rename = "type")]
+    target_type: String,
+    url: String,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VisibleSocialMetrics {
+    page_confirmed: bool,
+    selectors_confirmed: bool,
+    display_name: Option<String>,
+    account_identity: Option<String>,
+    followers: Option<u64>,
+    followers_confirmed: bool,
+    unread_messages: Option<u64>,
+    messages_confirmed: bool,
+    unread_notifications: Option<u64>,
+    notifications_confirmed: bool,
+}
+
+#[cfg(windows)]
+struct ManagedSocialSession {
+    platform: String,
+    process: OwnedHandle,
+    job: OwnedHandle,
+    command_input: Option<fs::File>,
+    responses: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
+    next_command_id: u64,
+    active_target_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +275,15 @@ struct DesktopOrganizeMove {
     organized: PathBuf,
     category: String,
     is_dir: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_identity: Option<DesktopOrganizeIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DesktopOrganizeIdentity {
+    volume_serial: u32,
+    file_index: u64,
+    digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,6 +311,8 @@ struct DesktopOrganizeItem {
 struct DesktopOrganizeResult {
     moved_count: usize,
     new_moved_count: usize,
+    personal_moved_count: usize,
+    public_moved_count: usize,
     migrated_count: usize,
     category_count: usize,
     skipped_count: usize,
@@ -195,6 +350,7 @@ struct DesktopOrganizeReviewResult {
 struct OrganizeState {
     can_undo: bool,
     batch_count: usize,
+    latest_batch_touches_public_desktop: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -315,15 +471,31 @@ struct ActiveAgentTask {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentTaskFailureCode {
+    Authentication,
+    Quota,
+    ModelUnavailable,
+    Network,
+    SessionNotFound,
+    Permission,
+    ProcessLaunch,
+    ExitFailure,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AgentTaskResult {
     task_id: String,
     connector_id: String,
+    app_session_id: String,
     success: bool,
     timed_out: bool,
     cancelled: bool,
     output: String,
+    failure_code: Option<AgentTaskFailureCode>,
+    provider_session_id: Option<String>,
     exit_code: Option<i32>,
     duration_ms: u64,
     truncated: bool,
@@ -506,11 +678,39 @@ struct OrganizeCandidate {
     is_dir: bool,
 }
 
+#[derive(Debug)]
+struct FileTransferError {
+    message: String,
+    permission_denied: bool,
+}
+
 struct OrganizePlan {
     candidates: Vec<OrganizeCandidate>,
     categories: BTreeSet<String>,
     excluded_count: usize,
     skipped_items: Vec<DesktopOrganizeSkippedItem>,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ElevatedFileTransfer {
+    source: PathBuf,
+    destination: PathBuf,
+    is_dir: bool,
+    source_digest: String,
+    source_volume_serial: u32,
+    source_file_index: u64,
+    source_size: u64,
+    source_last_write_time: u64,
+}
+
+#[cfg(windows)]
+#[derive(Debug, Serialize, Deserialize)]
+struct ElevatedFilePlan {
+    version: u8,
+    created_at_millis: u64,
+    library_root: PathBuf,
+    transfers: Vec<ElevatedFileTransfer>,
 }
 
 fn organize_category(path: &Path, is_dir: bool) -> &'static str {
@@ -708,9 +908,1165 @@ fn recreate_removed_directories(directories: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn windows_known_folder_path(
+    folder_id: &windows_sys::core::GUID,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let mut raw_path = std::ptr::null_mut();
+    let result = unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut raw_path) };
+    if result < 0 || raw_path.is_null() {
+        return Err(format!("无法定位 Windows {label}：HRESULT {result:#x}"));
+    }
+    let length = unsafe {
+        let mut length = 0usize;
+        while *raw_path.add(length) != 0 {
+            length += 1;
+        }
+        length
+    };
+    let value = OsString::from_wide(unsafe { std::slice::from_raw_parts(raw_path, length) });
+    unsafe { CoTaskMemFree(raw_path.cast()) };
+    Ok(PathBuf::from(value))
+}
+
+#[cfg(windows)]
+fn known_documents_directory() -> Result<PathBuf, String> {
+    windows_known_folder_path(&FOLDERID_Documents, "文档目录")
+}
+
+#[cfg(windows)]
+fn public_desktop_path() -> Option<PathBuf> {
+    windows_known_folder_path(&FOLDERID_PublicDesktop, "公共桌面").ok()
+}
+
+#[cfg(not(windows))]
+fn public_desktop_path() -> Option<PathBuf> {
+    None
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    path_reservation_key(left) == path_reservation_key(right)
+}
+
+fn is_desktop_source_parent(parent: &Path, user_desktop: &Path) -> bool {
+    same_path(parent, user_desktop)
+        || public_desktop_path().is_some_and(|public| same_path(parent, &public))
+}
+
+fn elevated_parent_pair_allowed(
+    source_parent: &Path,
+    destination_parent: &Path,
+    public_desktop: &Path,
+    library_root: &Path,
+) -> bool {
+    let source_in_public = same_path(source_parent, public_desktop);
+    let destination_in_public = same_path(destination_parent, public_desktop);
+    let source_in_library = source_parent
+        .parent()
+        .is_some_and(|parent| same_path(parent, library_root));
+    let destination_in_library = destination_parent
+        .parent()
+        .is_some_and(|parent| same_path(parent, library_root));
+    (source_in_public && destination_in_library) || (source_in_library && destination_in_public)
+}
+
+#[cfg(windows)]
+fn canonical_safe_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("无法检查{label} {}：{error}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(format!("{label}不是普通目录：{}", path.display()));
+    }
+    path.canonicalize()
+        .map_err(|error| format!("无法访问{label} {}：{error}", path.display()))
+}
+
+#[cfg(windows)]
+fn update_elevated_path_digest(
+    root: &Path,
+    path: &Path,
+    hasher: &mut Sha256,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("无法读取提权项目摘要 {}：{error}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || is_reparse_point(&metadata)
+        || (!metadata.is_file() && !metadata.is_dir())
+    {
+        return Err(format!(
+            "提权项目包含不安全的链接或特殊节点：{}",
+            path.display()
+        ));
+    }
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    hasher.update(if metadata.is_dir() { b"D" } else { b"F" });
+    hasher.update(relative.as_os_str().to_string_lossy().as_bytes());
+    hasher.update(metadata.file_size().to_le_bytes());
+    if metadata.is_file() {
+        let mut file = fs::File::open(path)
+            .map_err(|error| format!("无法读取提权文件摘要 {}：{error}", path.display()))?;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .map_err(|error| format!("无法读取提权文件摘要 {}：{error}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        return Ok(());
+    }
+    let mut children = fs::read_dir(path)
+        .map_err(|error| format!("无法遍历提权目录 {}：{error}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法遍历提权目录 {}：{error}", path.display()))?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        update_elevated_path_digest(root, &child.path(), hasher)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn elevated_path_digest(path: &Path) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    update_elevated_path_digest(path, path, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(windows)]
+fn elevated_plan_digest(serialized: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(serialized))
+}
+
+#[cfg(windows)]
+fn elevated_file_information(
+    handle: HANDLE,
+    label: &str,
+) -> Result<BY_HANDLE_FILE_INFORMATION, String> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+        return Err(format!("无法读取{label}文件身份"));
+    }
+    Ok(information)
+}
+
+#[cfg(windows)]
+fn elevated_identity_from_information(information: &BY_HANDLE_FILE_INFORMATION) -> (u32, u64) {
+    let file_index = ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64;
+    (information.dwVolumeSerialNumber, file_index)
+}
+
+#[cfg(windows)]
+fn elevated_file_identity(path: &Path) -> Result<(u32, u64), String> {
+    let wide = wide_null(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(format!("无法打开提权项目身份句柄：{}", path.display()));
+    }
+    let handle = owned_windows_handle(handle);
+    let information = elevated_file_information(handle.as_raw_handle() as HANDLE, "提权项目")?;
+    Ok(elevated_identity_from_information(&information))
+}
+
+#[cfg(windows)]
+fn desktop_organize_identity(path: &Path) -> Result<DesktopOrganizeIdentity, String> {
+    let (volume_serial, file_index) = elevated_file_identity(path)?;
+    Ok(DesktopOrganizeIdentity {
+        volume_serial,
+        file_index,
+        digest: elevated_path_digest(path)?,
+    })
+}
+
+#[cfg(windows)]
+fn verify_desktop_organize_identity(
+    path: &Path,
+    expected: &DesktopOrganizeIdentity,
+) -> Result<(), String> {
+    let actual = desktop_organize_identity(path)?;
+    if &actual == expected {
+        Ok(())
+    } else {
+        Err(format!("项目文件身份或内容摘要不匹配：{}", path.display()))
+    }
+}
+
+#[cfg(windows)]
+fn elevated_transfer_from_paths(
+    source: PathBuf,
+    destination: PathBuf,
+    is_dir: bool,
+) -> Result<ElevatedFileTransfer, String> {
+    let metadata =
+        fs::symlink_metadata(&source).map_err(|error| format!("提权移动来源不可访问：{error}"))?;
+    let (source_volume_serial, source_file_index) = elevated_file_identity(&source)?;
+    Ok(ElevatedFileTransfer {
+        source_digest: elevated_path_digest(&source)?,
+        source_volume_serial,
+        source_file_index,
+        source_size: metadata.file_size(),
+        source_last_write_time: metadata.last_write_time(),
+        source,
+        destination,
+        is_dir,
+    })
+}
+
+#[cfg(windows)]
+fn elevated_identity_matches(transfer: &ElevatedFileTransfer, metadata: &fs::Metadata) -> bool {
+    let identity_matches = elevated_file_identity(&transfer.source).is_ok_and(|identity| {
+        identity == (transfer.source_volume_serial, transfer.source_file_index)
+    });
+    metadata.is_dir() == transfer.is_dir
+        && metadata.file_size() == transfer.source_size
+        && metadata.last_write_time() == transfer.source_last_write_time
+        && identity_matches
+}
+
+#[cfg(windows)]
+fn validate_elevated_transfer(
+    transfer: &ElevatedFileTransfer,
+    public_desktop: &Path,
+    library_root: &Path,
+) -> Result<(), String> {
+    if !transfer.source.is_absolute() || !transfer.destination.is_absolute() {
+        return Err("提权文件计划只能包含绝对路径".to_string());
+    }
+    let metadata = fs::symlink_metadata(&transfer.source)
+        .map_err(|error| format!("提权移动来源不可访问：{error}"))?;
+    if metadata.file_type().is_symlink()
+        || is_reparse_point(&metadata)
+        || metadata.is_dir() != transfer.is_dir
+        || (!metadata.is_file() && !metadata.is_dir())
+    {
+        return Err(format!(
+            "提权移动来源不是安全的普通项目：{}",
+            transfer.source.display()
+        ));
+    }
+    if !elevated_identity_matches(transfer, &metadata)
+        || elevated_path_digest(&transfer.source)? != transfer.source_digest
+    {
+        return Err(format!(
+            "提权移动来源在确认后发生变化，已拒绝继续：{}",
+            transfer.source.display()
+        ));
+    }
+    let source_name = transfer
+        .source
+        .file_name()
+        .ok_or_else(|| "提权移动来源缺少文件名".to_string())?;
+    if is_hidden_or_system(source_name, &metadata) || is_wormhole_shortcut_name(source_name) {
+        return Err(format!(
+            "提权移动来源属于受保护项目：{}",
+            transfer.source.display()
+        ));
+    }
+    if fs::symlink_metadata(&transfer.destination).is_ok() {
+        return Err(format!(
+            "提权移动目标已经存在：{}",
+            transfer.destination.display()
+        ));
+    }
+    let source_parent = transfer
+        .source
+        .parent()
+        .ok_or_else(|| "提权移动来源缺少父目录".to_string())?;
+    let destination_parent = transfer
+        .destination
+        .parent()
+        .ok_or_else(|| "提权移动目标缺少父目录".to_string())?;
+    let source_parent = canonical_safe_directory(source_parent, "来源目录")?;
+    let destination_parent = canonical_safe_directory(destination_parent, "目标目录")?;
+    if !elevated_parent_pair_allowed(
+        &source_parent,
+        &destination_parent,
+        public_desktop,
+        library_root,
+    ) {
+        return Err(format!(
+            "提权移动只允许在公共桌面与虫洞派资料库分类之间进行：{} -> {}",
+            transfer.source.display(),
+            transfer.destination.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct ElevatedDirectoryGuard {
+    handle: OwnedHandle,
+    final_path: PathBuf,
+    volume_serial: u32,
+}
+
+#[cfg(windows)]
+struct PreparedElevatedMove {
+    source: OwnedHandle,
+    destination_parent: ElevatedDirectoryGuard,
+    destination_name: Vec<u16>,
+}
+
+#[cfg(windows)]
+fn final_path_from_handle(handle: HANDLE, label: &str) -> Result<PathBuf, String> {
+    let required = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, 0) };
+    if required == 0 {
+        return Err(format!("无法读取{label}最终路径"));
+    }
+    let mut buffer = vec![0u16; required as usize + 1];
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err(format!("无法读取{label}最终路径"));
+    }
+    Ok(PathBuf::from(OsString::from_wide(
+        &buffer[..written as usize],
+    )))
+}
+
+#[cfg(windows)]
+fn open_elevated_directory_guard(
+    path: &Path,
+    label: &str,
+) -> Result<ElevatedDirectoryGuard, String> {
+    let wide = wide_null(path.as_os_str());
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES | FILE_TRAVERSE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(format!("无法锁定{label} {}", path.display()));
+    }
+    let handle = owned_windows_handle(handle);
+    let information = elevated_file_information(handle.as_raw_handle() as HANDLE, label)?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(format!("{label}不是安全的普通目录：{}", path.display()));
+    }
+    Ok(ElevatedDirectoryGuard {
+        final_path: final_path_from_handle(handle.as_raw_handle() as HANDLE, label)?,
+        volume_serial: information.dwVolumeSerialNumber,
+        handle,
+    })
+}
+
+#[cfg(windows)]
+fn elevated_last_write_time(information: &BY_HANDLE_FILE_INFORMATION) -> u64 {
+    ((information.ftLastWriteTime.dwHighDateTime as u64) << 32)
+        | information.ftLastWriteTime.dwLowDateTime as u64
+}
+
+#[cfg(windows)]
+fn elevated_file_size(information: &BY_HANDLE_FILE_INFORMATION) -> u64 {
+    ((information.nFileSizeHigh as u64) << 32) | information.nFileSizeLow as u64
+}
+
+#[cfg(windows)]
+fn safe_elevated_destination_name(path: &Path) -> Result<Vec<u16>, String> {
+    let name = path
+        .file_name()
+        .ok_or_else(|| "提权移动目标缺少文件名".to_string())?;
+    let name_text = name.to_string_lossy();
+    if matches!(name_text.as_ref(), "." | "..")
+        || name_text.contains(['\\', '/', ':'])
+        || name_text.contains('\0')
+    {
+        return Err("提权移动目标文件名不安全".to_string());
+    }
+    let wide = name.encode_wide().collect::<Vec<_>>();
+    if wide.is_empty() || wide.len() > 255 {
+        return Err("提权移动目标文件名为空或过长".to_string());
+    }
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn ensure_public_elevated_same_volume(
+    source_volume_serial: u32,
+    destination_volume_serial: u32,
+) -> Result<(), String> {
+    if source_volume_serial == destination_volume_serial {
+        Ok(())
+    } else {
+        Err("公共桌面跨卷暂不自动处理，请手工处理该项目后刷新资料库。".to_string())
+    }
+}
+
+#[cfg(windows)]
+fn prepare_elevated_move(
+    transfer: &ElevatedFileTransfer,
+    public_desktop: &Path,
+    library_root: &Path,
+) -> Result<PreparedElevatedMove, String> {
+    let source_parent = transfer
+        .source
+        .parent()
+        .ok_or_else(|| "提权移动来源缺少父目录".to_string())?;
+    let destination_parent = transfer
+        .destination
+        .parent()
+        .ok_or_else(|| "提权移动目标缺少父目录".to_string())?;
+    let public_guard = open_elevated_directory_guard(public_desktop, "公共桌面")?;
+    let library_guard = open_elevated_directory_guard(library_root, "虫洞派资料库")?;
+    let source_parent_guard = open_elevated_directory_guard(source_parent, "来源目录")?;
+    let destination_parent_guard = open_elevated_directory_guard(destination_parent, "目标目录")?;
+    if !elevated_parent_pair_allowed(
+        &source_parent_guard.final_path,
+        &destination_parent_guard.final_path,
+        &public_guard.final_path,
+        &library_guard.final_path,
+    ) {
+        return Err(format!(
+            "提权移动目录在执行前发生变化，已拒绝继续：{} -> {}",
+            transfer.source.display(),
+            transfer.destination.display()
+        ));
+    }
+    let source_wide = wide_null(transfer.source.as_os_str());
+    let source = unsafe {
+        CreateFileW(
+            source_wide.as_ptr(),
+            DELETE | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if source == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "无法锁定提权移动来源，项目可能正在使用：{}",
+            transfer.source.display()
+        ));
+    }
+    let source = owned_windows_handle(source);
+    let information = elevated_file_information(source.as_raw_handle() as HANDLE, "提权移动来源")?;
+    let source_is_dir = information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || source_is_dir != transfer.is_dir
+        || elevated_identity_from_information(&information)
+            != (transfer.source_volume_serial, transfer.source_file_index)
+        || elevated_file_size(&information) != transfer.source_size
+        || elevated_last_write_time(&information) != transfer.source_last_write_time
+        || elevated_path_digest(&transfer.source)? != transfer.source_digest
+    {
+        return Err(format!(
+            "提权移动来源在执行前发生变化，已拒绝继续：{}",
+            transfer.source.display()
+        ));
+    }
+    ensure_public_elevated_same_volume(
+        transfer.source_volume_serial,
+        destination_parent_guard.volume_serial,
+    )?;
+    Ok(PreparedElevatedMove {
+        source,
+        destination_parent: destination_parent_guard,
+        destination_name: safe_elevated_destination_name(&transfer.destination)?,
+    })
+}
+
+#[cfg(windows)]
+fn rename_prepared_elevated_move(prepared: &PreparedElevatedMove) -> Result<(), String> {
+    let header_size = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let byte_len = header_size + prepared.destination_name.len() * std::mem::size_of::<u16>();
+    let word_len = byte_len.div_ceil(std::mem::size_of::<u64>());
+    let mut storage = vec![0u64; word_len];
+    let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*information).Anonymous.ReplaceIfExists = false;
+        (*information).RootDirectory = prepared.destination_parent.handle.as_raw_handle() as HANDLE;
+        (*information).FileNameLength =
+            (prepared.destination_name.len() * std::mem::size_of::<u16>()) as u32;
+        std::ptr::copy_nonoverlapping(
+            prepared.destination_name.as_ptr(),
+            (*information).FileName.as_mut_ptr(),
+            prepared.destination_name.len(),
+        );
+    }
+    if unsafe {
+        SetFileInformationByHandle(
+            prepared.source.as_raw_handle() as HANDLE,
+            FileRenameInfo,
+            information.cast(),
+            byte_len as u32,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "受控句柄重命名失败：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn remove_elevated_copy_checked(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("无法检查待清理项目 {}：{error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(format!("拒绝清理链接或重解析点：{}", path.display()));
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+            .map_err(|error| format!("无法清理目录 {}：{error}", path.display()))?;
+    } else if metadata.is_file() {
+        fs::remove_file(path)
+            .map_err(|error| format!("无法清理文件 {}：{error}", path.display()))?;
+    } else {
+        return Err(format!("拒绝清理特殊项目：{}", path.display()));
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(format!("清理后项目仍然存在：{}", path.display())),
+        Err(error) => Err(format!("无法复核清理结果 {}：{error}", path.display())),
+    }
+}
+
+#[cfg(windows)]
+fn remove_elevated_copy(path: &Path) {
+    let _ = remove_elevated_copy_checked(path);
+}
+
+#[cfg(windows)]
+fn copy_elevated_path(source: &Path, destination: &Path) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| format!("跨卷复制来源不可访问：{error}"))?;
+    if metadata.file_type().is_symlink()
+        || is_reparse_point(&metadata)
+        || (!metadata.is_file() && !metadata.is_dir())
+    {
+        return Err(format!("跨卷复制拒绝链接或特殊项目：{}", source.display()));
+    }
+    if metadata.is_file() {
+        let mut input =
+            fs::File::open(source).map_err(|error| format!("无法打开跨卷复制来源：{error}"))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut output = options
+            .open(destination)
+            .map_err(|error| format!("无法创建跨卷复制目标：{error}"))?;
+        std::io::copy(&mut input, &mut output)
+            .and_then(|_| output.sync_all())
+            .map_err(|error| format!("跨卷复制文件失败：{error}"))?;
+        return Ok(());
+    }
+    fs::create_dir(destination).map_err(|error| format!("无法创建跨卷目标目录：{error}"))?;
+    let mut children = fs::read_dir(source)
+        .map_err(|error| format!("无法读取跨卷来源目录：{error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("无法读取跨卷来源目录：{error}"))?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        if let Err(error) = copy_elevated_path(&child.path(), &destination.join(child.file_name()))
+        {
+            remove_elevated_copy(destination);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn cross_volume_elevated_move(transfer: &ElevatedFileTransfer) -> Result<(), String> {
+    if let Err(error) = copy_elevated_path(&transfer.source, &transfer.destination) {
+        remove_elevated_copy(&transfer.destination);
+        return Err(error);
+    }
+    let destination_digest = match elevated_path_digest(&transfer.destination) {
+        Ok(digest) => digest,
+        Err(error) => {
+            remove_elevated_copy(&transfer.destination);
+            return Err(error);
+        }
+    };
+    let source_digest = match elevated_path_digest(&transfer.source) {
+        Ok(digest) => digest,
+        Err(error) => {
+            remove_elevated_copy(&transfer.destination);
+            return Err(error);
+        }
+    };
+    if destination_digest != transfer.source_digest || source_digest != transfer.source_digest {
+        remove_elevated_copy(&transfer.destination);
+        return Err("跨卷复制摘要校验失败，来源保持不变".to_string());
+    }
+    if !transfer.is_dir {
+        if let Err(error) = fs::remove_file(&transfer.source) {
+            remove_elevated_copy(&transfer.destination);
+            return Err(format!("跨卷复制完成但无法移除原文件：{error}"));
+        }
+        return Ok(());
+    }
+    let source_parent = transfer
+        .source
+        .parent()
+        .ok_or_else(|| "跨卷来源缺少父目录".to_string())?;
+    let quarantine = source_parent.join(format!(
+        ".wormhole-pie-quarantine-{}-{}",
+        std::process::id(),
+        now_millis()
+    ));
+    if fs::symlink_metadata(&quarantine).is_ok() {
+        remove_elevated_copy(&transfer.destination);
+        return Err("跨卷隔离目录已存在，已拒绝继续".to_string());
+    }
+    if let Err(error) = fs::rename(&transfer.source, &quarantine) {
+        remove_elevated_copy(&transfer.destination);
+        return Err(format!("跨卷复制完成但无法隔离原目录：{error}"));
+    }
+    let quarantine_wide = wide_null(quarantine.as_os_str());
+    unsafe {
+        SetFileAttributesW(quarantine_wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN);
+    }
+    remove_elevated_copy_checked(&quarantine).map_err(|error| {
+        format!(
+            "recovery_required：跨卷来源已隔离但未能完全清理 {}：{error}",
+            quarantine.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn move_elevated_transfer(
+    transfer: &ElevatedFileTransfer,
+    public_desktop: &Path,
+    library_root: &Path,
+) -> Result<(), String> {
+    let prepared = prepare_elevated_move(transfer, public_desktop, library_root)?;
+    rename_prepared_elevated_move(&prepared)
+}
+
+#[cfg(windows)]
+fn verify_elevated_transfer_completed(transfer: &ElevatedFileTransfer) -> Result<(), String> {
+    match fs::symlink_metadata(&transfer.source) {
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(format!(
+                "提权移动完成后来源仍然存在：{}",
+                transfer.source.display()
+            ))
+        }
+        Err(error) => return Err(format!("无法复核提权移动来源：{error}")),
+    }
+    let metadata = fs::symlink_metadata(&transfer.destination)
+        .map_err(|error| format!("提权移动目标不可访问：{error}"))?;
+    let (destination_volume_serial, destination_file_index) =
+        elevated_file_identity(&transfer.destination)?;
+    if metadata.file_type().is_symlink()
+        || is_reparse_point(&metadata)
+        || metadata.is_dir() != transfer.is_dir
+        || (destination_volume_serial == transfer.source_volume_serial
+            && destination_file_index != transfer.source_file_index)
+        || elevated_path_digest(&transfer.destination)? != transfer.source_digest
+    {
+        return Err(format!(
+            "提权移动目标与已确认来源不一致：{}",
+            transfer.destination.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn rollback_elevated_transfers(
+    completed: &[ElevatedFileTransfer],
+    public_desktop: &Path,
+    library_root: &Path,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for transfer in completed.iter().rev() {
+        if fs::symlink_metadata(&transfer.source).is_ok() {
+            failures.push(format!("回滚目标已被占用：{}", transfer.source.display()));
+            continue;
+        }
+        let destination_metadata = match fs::symlink_metadata(&transfer.destination) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                failures.push(format!("回滚来源不可访问：{error}"));
+                continue;
+            }
+        };
+        if destination_metadata.file_type().is_symlink()
+            || is_reparse_point(&destination_metadata)
+            || destination_metadata.is_dir() != transfer.is_dir
+        {
+            failures.push(format!(
+                "回滚来源已被替换，已停止提权回滚：{}",
+                transfer.destination.display()
+            ));
+            continue;
+        }
+        match elevated_file_identity(&transfer.destination) {
+            Ok((volume_serial, file_index))
+                if volume_serial != transfer.source_volume_serial
+                    || file_index == transfer.source_file_index => {}
+            Ok(_) => {
+                failures.push(format!(
+                    "回滚来源文件身份不一致，已停止提权回滚：{}",
+                    transfer.destination.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        }
+        match elevated_path_digest(&transfer.destination) {
+            Ok(digest) if digest == transfer.source_digest => {}
+            Ok(_) => {
+                failures.push(format!(
+                    "回滚来源摘要不一致，已停止提权回滚：{}",
+                    transfer.destination.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        }
+        let reverse = match elevated_transfer_from_paths(
+            transfer.destination.clone(),
+            transfer.source.clone(),
+            transfer.is_dir,
+        ) {
+            Ok(reverse) => reverse,
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        };
+        if let Err(error) = validate_elevated_transfer(&reverse, public_desktop, library_root) {
+            failures.push(error);
+            continue;
+        }
+        if let Err(error) = move_elevated_transfer(&reverse, public_desktop, library_root) {
+            failures.push(format!("受控提权回滚失败：{error}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("recovery_required：{}", failures.join("；")))
+    }
+}
+
+#[cfg(windows)]
+fn execute_elevated_file_plan(plan_path: &Path, expected_digest: &str) -> Result<(), String> {
+    let helper_root = std::env::temp_dir().join("wormhole-pie-elevated-plans");
+    let helper_root = canonical_safe_directory(&helper_root, "提权计划目录")?;
+    let plan_parent = plan_path
+        .parent()
+        .ok_or_else(|| "提权计划缺少父目录".to_string())?;
+    let plan_parent = canonical_safe_directory(plan_parent, "提权计划目录")?;
+    if !same_path(&helper_root, &plan_parent) {
+        return Err("提权计划不在虫洞派受控临时目录中".to_string());
+    }
+    let plan_metadata =
+        fs::symlink_metadata(plan_path).map_err(|error| format!("无法读取提权计划：{error}"))?;
+    if !plan_metadata.is_file()
+        || plan_metadata.file_type().is_symlink()
+        || is_reparse_point(&plan_metadata)
+        || plan_metadata.len() > 1024 * 1024
+    {
+        return Err("提权计划文件不安全或过大".to_string());
+    }
+    let serialized = fs::read(plan_path).map_err(|error| format!("无法读取提权计划：{error}"))?;
+    if expected_digest.len() != 64
+        || !expected_digest
+            .bytes()
+            .all(|value| value.is_ascii_hexdigit())
+        || elevated_plan_digest(&serialized) != expected_digest.to_ascii_lowercase()
+    {
+        return Err("提权计划摘要不匹配，已拒绝执行".to_string());
+    }
+    let plan: ElevatedFilePlan = serde_json::from_slice(&serialized)
+        .map_err(|error| format!("提权计划格式无效：{error}"))?;
+    let plan_age = now_millis().saturating_sub(plan.created_at_millis);
+    if plan.version != ELEVATED_FILE_PLAN_VERSION
+        || plan.created_at_millis > now_millis().saturating_add(30_000)
+        || plan_age > 5 * 60 * 1_000
+        || plan.transfers.is_empty()
+        || plan.transfers.len() > 500
+    {
+        return Err("提权计划版本无效或项目数量超限".to_string());
+    }
+    let public_desktop =
+        public_desktop_path().ok_or_else(|| "无法定位 Windows 公共桌面".to_string())?;
+    let public_desktop = canonical_safe_directory(&public_desktop, "公共桌面")?;
+    let expected_library = known_documents_directory()?.join(LIBRARY_ROOT_NAME);
+    let expected_library = canonical_safe_directory(&expected_library, "虫洞派资料库")?;
+    let requested_library = canonical_safe_directory(&plan.library_root, "计划资料库")?;
+    if !same_path(&expected_library, &requested_library) {
+        return Err("提权计划中的资料库不是当前用户的虫洞派资料库".to_string());
+    }
+    for transfer in &plan.transfers {
+        validate_elevated_transfer(transfer, &public_desktop, &expected_library)?;
+    }
+
+    let mut completed: Vec<ElevatedFileTransfer> = Vec::new();
+    for transfer in &plan.transfers {
+        validate_elevated_transfer(transfer, &public_desktop, &expected_library)?;
+        if let Err(error) = move_elevated_transfer(transfer, &public_desktop, &expected_library) {
+            let rollback_error =
+                rollback_elevated_transfers(&completed, &public_desktop, &expected_library).err();
+            return Err(format!(
+                "受控提权移动失败：{error}{}",
+                rollback_error
+                    .map(|value| format!("；{value}"))
+                    .unwrap_or_default()
+            ));
+        }
+        if let Err(error) = verify_elevated_transfer_completed(transfer) {
+            let mut rollback_items = completed.clone();
+            rollback_items.push(transfer.clone());
+            let rollback_error =
+                rollback_elevated_transfers(&rollback_items, &public_desktop, &expected_library)
+                    .err();
+            return Err(format!(
+                "受控提权移动复核失败：{error}{}",
+                rollback_error
+                    .map(|value| format!("；{value}"))
+                    .unwrap_or_default()
+            ));
+        }
+        completed.push(transfer.clone());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn maybe_run_elevated_file_plan() -> Option<i32> {
+    let mut arguments = std::env::args_os();
+    let _ = arguments.next();
+    let flag = arguments.next()?;
+    if flag != OsStr::new(ELEVATED_FILE_PLAN_ARG) {
+        return None;
+    }
+    let Some(plan_path) = arguments.next().map(PathBuf::from) else {
+        return Some(2);
+    };
+    let Some(expected_digest) = arguments.next().and_then(|value| value.into_string().ok()) else {
+        return Some(2);
+    };
+    if arguments.next().is_some() {
+        return Some(2);
+    }
+    match execute_elevated_file_plan(&plan_path, &expected_digest) {
+        Ok(()) => Some(0),
+        Err(_) => Some(1),
+    }
+}
+
+#[cfg(windows)]
+fn wide_null(value: &OsStr) -> Vec<u16> {
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn protected_program_files_roots() -> Vec<PathBuf> {
+    let mut roots = [
+        (&FOLDERID_ProgramFiles, "Program Files"),
+        (&FOLDERID_ProgramFilesX64, "Program Files x64"),
+        (&FOLDERID_ProgramFilesX86, "Program Files x86"),
+    ]
+    .into_iter()
+    .filter_map(|(folder_id, label)| windows_known_folder_path(folder_id, label).ok())
+    .filter_map(|root| root.canonicalize().ok())
+    .collect::<Vec<_>>();
+    roots.sort_by_key(|root| path_reservation_key(root));
+    roots.dedup_by(|left, right| same_path(left, right));
+    roots
+}
+
+#[cfg(windows)]
+fn path_is_under_protected_install_root(executable: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| executable.starts_with(root))
+}
+
+#[cfg(windows)]
+fn directory_is_writable_by_current_process(directory: &Path) -> Result<bool, String> {
+    for attempt in 0..8u64 {
+        let probe = directory.join(format!(
+            ".wormhole-pie-write-probe-{}-{}-{attempt}.tmp",
+            std::process::id(),
+            now_millis()
+        ));
+        let mut options = fs::OpenOptions::new();
+        match options.write(true).create_new(true).open(&probe) {
+            Ok(file) => {
+                drop(file);
+                fs::remove_file(&probe).map_err(|error| {
+                    format!("安装目录写入探针无法清理 {}：{error}", probe.display())
+                })?;
+                return Ok(true);
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return Ok(false),
+            Err(error) => {
+                return Err(format!(
+                    "无法确认安装目录是否受保护 {}：{error}",
+                    directory.display()
+                ))
+            }
+        }
+    }
+    Err("无法生成唯一的安装目录写入探针".to_string())
+}
+
+#[cfg(windows)]
+fn elevated_helper_result_is_complete(exit_code: u32, completed: usize, total: usize) -> bool {
+    exit_code == 0 && completed == total
+}
+
+#[cfg(windows)]
+fn execute_permission_denied_transfers(
+    transfers: &[(PathBuf, PathBuf, bool)],
+    expected_identities: Option<&BTreeMap<String, DesktopOrganizeIdentity>>,
+) -> Result<(), String> {
+    if transfers.is_empty() {
+        return Ok(());
+    }
+    let library_root = known_documents_directory()?.join(LIBRARY_ROOT_NAME);
+    let library_root = canonical_safe_directory(&library_root, "虫洞派资料库")?;
+    let public_desktop =
+        public_desktop_path().ok_or_else(|| "无法定位 Windows 公共桌面".to_string())?;
+    let public_desktop = canonical_safe_directory(&public_desktop, "公共桌面")?;
+    let elevated_transfers = transfers
+        .iter()
+        .map(|(source, destination, is_dir)| {
+            elevated_transfer_from_paths(source.clone(), destination.clone(), *is_dir)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(expected_identities) = expected_identities {
+        for transfer in &elevated_transfers {
+            let expected = expected_identities
+                .get(&path_reservation_key(&transfer.source))
+                .ok_or_else(|| {
+                    format!(
+                        "recovery_required：公共桌面恢复缺少已确认身份：{}",
+                        transfer.source.display()
+                    )
+                })?;
+            let actual = DesktopOrganizeIdentity {
+                volume_serial: transfer.source_volume_serial,
+                file_index: transfer.source_file_index,
+                digest: transfer.source_digest.clone(),
+            };
+            if &actual != expected {
+                return Err(format!(
+                    "recovery_required：公共桌面待恢复项目已被替换或修改，已拒绝放回：{}",
+                    transfer.source.display()
+                ));
+            }
+        }
+    }
+    for transfer in &elevated_transfers {
+        validate_elevated_transfer(transfer, &public_desktop, &library_root)?;
+    }
+    let helper_root = std::env::temp_dir().join("wormhole-pie-elevated-plans");
+    fs::create_dir_all(&helper_root).map_err(|error| format!("无法创建提权计划目录：{error}"))?;
+    canonical_safe_directory(&helper_root, "提权计划目录")?;
+    let plan_path = helper_root.join(format!("plan-{}-{}.json", now_millis(), std::process::id()));
+    let plan = ElevatedFilePlan {
+        version: ELEVATED_FILE_PLAN_VERSION,
+        created_at_millis: now_millis(),
+        library_root,
+        transfers: elevated_transfers,
+    };
+    let serialized =
+        serde_json::to_vec(&plan).map_err(|error| format!("无法生成提权文件计划：{error}"))?;
+    let plan_digest = elevated_plan_digest(&serialized);
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options
+        .open(&plan_path)
+        .map_err(|error| format!("无法保存提权文件计划：{error}"))?;
+    use std::io::Write;
+    file.write_all(&serialized)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| format!("无法保存提权文件计划：{error}"))?;
+    drop(file);
+
+    let executable = std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|error| format!("无法定位虫洞派程序：{error}"))?;
+    let executable_metadata = fs::symlink_metadata(&executable)
+        .map_err(|error| format!("无法检查虫洞派程序：{error}"))?;
+    if !executable_metadata.is_file()
+        || executable_metadata.file_type().is_symlink()
+        || is_reparse_point(&executable_metadata)
+    {
+        let _ = fs::remove_file(&plan_path);
+        return Err("公共桌面管理员移动要求受保护的正式安装程序。".to_string());
+    }
+    let protected_roots = protected_program_files_roots();
+    if !path_is_under_protected_install_root(&executable, &protected_roots) {
+        let _ = fs::remove_file(&plan_path);
+        return Err("公共桌面管理员移动只在安装到 Program Files 的正式版本中启用；开发版、便携版和用户可写目录已禁用。".to_string());
+    }
+    let install_directory = executable
+        .parent()
+        .ok_or_else(|| "无法识别虫洞派安装目录".to_string())?;
+    match directory_is_writable_by_current_process(install_directory) {
+        Ok(false) => {}
+        Ok(true) => {
+            let _ = fs::remove_file(&plan_path);
+            return Err(
+                "虫洞派安装目录对当前用户可写，已禁用公共桌面管理员移动。请使用受保护的正式安装版。"
+                    .to_string(),
+            );
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&plan_path);
+            return Err(error);
+        }
+    }
+    let verb = wide_null(OsStr::new("runas"));
+    let executable_wide = wide_null(executable.as_os_str());
+    let parameters = wide_null(OsStr::new(&format!(
+        "{} \"{}\" {}",
+        ELEVATED_FILE_PLAN_ARG,
+        plan_path.display(),
+        plan_digest,
+    )));
+    let mut execute_info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    execute_info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    execute_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    execute_info.lpVerb = verb.as_ptr();
+    execute_info.lpFile = executable_wide.as_ptr();
+    execute_info.lpParameters = parameters.as_ptr();
+    execute_info.nShow = SW_SHOWNORMAL;
+    if unsafe { ShellExecuteExW(&mut execute_info) } == 0 || execute_info.hProcess.is_null() {
+        let _ = fs::remove_file(&plan_path);
+        return Err("需要管理员授权才能收纳公共桌面项目，授权已取消或启动失败。".to_string());
+    }
+    let process = owned_windows_handle(execute_info.hProcess);
+    let wait_ms = ELEVATED_FILE_PLAN_TIMEOUT.as_millis().min(u32::MAX as u128) as u32;
+    let wait_result = unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, wait_ms) };
+    if wait_result == WAIT_TIMEOUT {
+        unsafe {
+            TerminateProcess(process.as_raw_handle() as HANDLE, 124);
+            WaitForSingleObject(process.as_raw_handle() as HANDLE, 5_000);
+        }
+        let _ = fs::remove_file(&plan_path);
+        return Err("管理员文件移动超时并已终止；请检查公共桌面与资料库后重试。".to_string());
+    }
+    if wait_result != WAIT_OBJECT_0 {
+        let _ = fs::remove_file(&plan_path);
+        return Err("无法确认管理员文件移动是否结束，请检查公共桌面与资料库。".to_string());
+    }
+    let mut exit_code = 1u32;
+    if unsafe { GetExitCodeProcess(process.as_raw_handle() as HANDLE, &mut exit_code) } == 0 {
+        let _ = fs::remove_file(&plan_path);
+        return Err("无法读取管理员文件移动结果，请检查公共桌面与资料库。".to_string());
+    }
+    let _ = fs::remove_file(&plan_path);
+    let completed = plan
+        .transfers
+        .iter()
+        .filter(|transfer| verify_elevated_transfer_completed(transfer).is_ok())
+        .count();
+    if elevated_helper_result_is_complete(exit_code, completed, plan.transfers.len()) {
+        return Ok(());
+    }
+    if completed == plan.transfers.len() {
+        return Err(format!(
+            "recovery_required：管理员 helper 返回退出码 {exit_code}，虽已找到全部目标，但清理或复核没有完整成功。"
+        ));
+    }
+    if completed > 0 {
+        return Err(format!(
+            "recovery_required：管理员移动仅完成 {completed}/{} 项，已停止自动回滚；请检查公共桌面与资料库。",
+            plan.transfers.len()
+        ));
+    }
+    Err(if exit_code == 0 {
+        "管理员文件移动没有通过完成校验，桌面未记录为已整理。".to_string()
+    } else {
+        format!("管理员文件移动未完成（退出码 {exit_code}）。")
+    })
+}
+
+#[cfg(not(windows))]
+fn execute_permission_denied_transfers(
+    _transfers: &[(PathBuf, PathBuf, bool)],
+    _expected_identities: Option<&BTreeMap<String, DesktopOrganizeIdentity>>,
+) -> Result<(), String> {
+    Err("当前系统不支持公共桌面提权移动".to_string())
+}
+
+fn move_regular_transfer(
+    source: &Path,
+    destination: &Path,
+    is_dir: bool,
+) -> Result<(), FileTransferError> {
+    match fs::rename(source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::CrossesDevices => {
+            #[cfg(windows)]
+            {
+                let transfer = elevated_transfer_from_paths(
+                    source.to_path_buf(),
+                    destination.to_path_buf(),
+                    is_dir,
+                )
+                .map_err(|message| FileTransferError {
+                    message,
+                    permission_denied: false,
+                })?;
+                cross_volume_elevated_move(&transfer).map_err(|message| FileTransferError {
+                    message,
+                    permission_denied: false,
+                })
+            }
+            #[cfg(not(windows))]
+            {
+                Err(FileTransferError {
+                    message: format!("跨卷移动暂不支持：{error}"),
+                    permission_denied: false,
+                })
+            }
+        }
+        Err(error) => Err(FileTransferError {
+            permission_denied: error.kind() == ErrorKind::PermissionDenied,
+            message: error.to_string(),
+        }),
+    }
+}
+
 fn rollback_transfers(transfers: &[(PathBuf, PathBuf, bool)]) -> Result<(), String> {
     let mut reserved = HashSet::new();
     let mut failures = Vec::new();
+    let mut permission_denied = Vec::new();
 
     for (source, destination, is_dir) in transfers.iter().rev() {
         if !destination.exists() {
@@ -733,13 +2089,22 @@ fn rollback_transfers(transfers: &[(PathBuf, PathBuf, bool)]) -> Result<(), Stri
                 continue;
             }
         };
-        if let Err(error) = fs::rename(destination, &rollback_target) {
-            failures.push(format!(
-                "无法将 {} 回滚到 {}：{error}",
-                destination.display(),
-                rollback_target.display()
-            ));
+        if let Err(error) = move_regular_transfer(destination, &rollback_target, *is_dir) {
+            if error.permission_denied {
+                permission_denied.push((destination.clone(), rollback_target, *is_dir));
+            } else {
+                failures.push(format!(
+                    "无法将 {} 回滚到 {}：{}",
+                    destination.display(),
+                    rollback_target.display(),
+                    error.message,
+                ));
+            }
         }
+    }
+
+    if let Err(error) = execute_permission_denied_transfers(&permission_denied, None) {
+        failures.push(error);
     }
 
     if failures.is_empty() {
@@ -751,23 +2116,210 @@ fn rollback_transfers(transfers: &[(PathBuf, PathBuf, bool)]) -> Result<(), Stri
 
 fn execute_transfers(transfers: &[(PathBuf, PathBuf, bool)]) -> Result<(), String> {
     let mut completed = Vec::new();
+    let mut permission_denied = Vec::new();
     for (source, destination, is_dir) in transfers {
-        if let Err(error) = fs::rename(source, destination) {
+        if let Err(error) = move_regular_transfer(source, destination, *is_dir) {
+            if error.permission_denied {
+                permission_denied.push((source.clone(), destination.clone(), *is_dir));
+                continue;
+            }
             let rollback = rollback_transfers(&completed);
             return Err(match rollback {
                 Ok(()) => format!(
-                    "移动 {} 到 {} 失败，已回滚本次整理：{error}",
+                    "移动 {} 到 {} 失败，已回滚本次整理：{}",
                     source.display(),
-                    destination.display()
+                    destination.display(),
+                    error.message,
                 ),
                 Err(rollback_error) => format!(
-                    "移动 {} 到 {} 失败：{error}；回滚同时失败：{rollback_error}",
+                    "移动 {} 到 {} 失败：{}；回滚同时失败：{rollback_error}",
                     source.display(),
-                    destination.display()
+                    destination.display(),
+                    error.message,
                 ),
             });
         }
         completed.push((source.clone(), destination.clone(), *is_dir));
+    }
+    if let Err(error) = execute_permission_denied_transfers(&permission_denied, None) {
+        let rollback = rollback_transfers(&completed);
+        return Err(match rollback {
+            Ok(()) => format!("公共桌面项目移动失败，已回滚本次整理：{error}"),
+            Err(rollback_error) => {
+                format!("公共桌面项目移动失败：{error}；回滚同时失败：{rollback_error}")
+            }
+        });
+    }
+    Ok(())
+}
+
+fn transfer_starts_on_public_desktop(source: &Path) -> bool {
+    let Some(parent) = source.parent() else {
+        return false;
+    };
+    public_desktop_path().is_some_and(|public_desktop| same_path(parent, &public_desktop))
+}
+
+fn transfer_touches_public_desktop(source: &Path, destination: &Path) -> bool {
+    transfer_starts_on_public_desktop(source) || transfer_starts_on_public_desktop(destination)
+}
+
+fn batch_touches_public_desktop(batch: &DesktopOrganizeBatch) -> bool {
+    batch
+        .moves
+        .iter()
+        .any(|item| transfer_starts_on_public_desktop(&item.original))
+}
+
+#[cfg(windows)]
+fn normalized_confirmation_move_ids(mut move_ids: Vec<String>) -> Vec<String> {
+    move_ids.sort();
+    move_ids.dedup();
+    move_ids
+}
+
+#[cfg(windows)]
+fn issue_public_desktop_confirmation(
+    confirmations: &Mutex<BTreeMap<String, PublicDesktopConfirmation>>,
+    action: &str,
+    batch_id: Option<String>,
+    move_ids: Vec<String>,
+    organize_snapshot_digest: Option<String>,
+) -> Result<String, String> {
+    let now = now_millis();
+    let sequence = PUBLIC_DESKTOP_CONFIRMATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let move_ids = normalized_confirmation_move_ids(move_ids);
+    let token = format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{now}:{}:{sequence}:{action}:{}:{}:{}",
+                std::process::id(),
+                batch_id.as_deref().unwrap_or_default(),
+                move_ids.join("\u{0}"),
+                organize_snapshot_digest.as_deref().unwrap_or_default()
+            )
+            .as_bytes()
+        )
+    );
+    let mut confirmations = confirmations
+        .lock()
+        .map_err(|_| "公共桌面确认状态已锁定".to_string())?;
+    confirmations.retain(|_, confirmation| confirmation.expires_at > now);
+    if confirmations.len() >= 64 {
+        confirmations.clear();
+    }
+    confirmations.insert(
+        token.clone(),
+        PublicDesktopConfirmation {
+            action: action.to_string(),
+            batch_id,
+            move_ids,
+            organize_snapshot_digest,
+            expires_at: now + PUBLIC_DESKTOP_CONFIRMATION_TTL.as_millis() as u64,
+        },
+    );
+    Ok(token)
+}
+
+#[cfg(windows)]
+fn consume_public_desktop_confirmation(
+    confirmations: &Mutex<BTreeMap<String, PublicDesktopConfirmation>>,
+    token: Option<&str>,
+    action: &str,
+    batch_id: Option<&str>,
+    move_ids: Vec<String>,
+    organize_snapshot_digest: Option<&str>,
+) -> Result<(), String> {
+    let token = token.ok_or_else(|| "公共桌面操作缺少二次确认令牌".to_string())?;
+    let now = now_millis();
+    let mut confirmations = confirmations
+        .lock()
+        .map_err(|_| "公共桌面确认状态已锁定".to_string())?;
+    confirmations.retain(|_, confirmation| confirmation.expires_at > now);
+    let confirmation = confirmations
+        .remove(token)
+        .ok_or_else(|| "公共桌面二次确认已失效，请重新确认".to_string())?;
+    if confirmation.action != action
+        || confirmation.batch_id.as_deref() != batch_id
+        || confirmation.move_ids != normalized_confirmation_move_ids(move_ids)
+        || confirmation.organize_snapshot_digest.as_deref() != organize_snapshot_digest
+        || confirmation.expires_at <= now
+    {
+        return Err("公共桌面二次确认与当前操作不匹配，请重新确认".to_string());
+    }
+    Ok(())
+}
+
+fn capture_public_move_identities(moves: &mut [DesktopOrganizeMove]) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        for item in moves
+            .iter_mut()
+            .filter(|item| transfer_starts_on_public_desktop(&item.original))
+        {
+            item.public_identity =
+                Some(desktop_organize_identity(&item.organized).map_err(|error| {
+                    format!(
+                        "公共桌面项目移动后无法保存身份，已拒绝记录本批次：{}：{error}",
+                        item.organized.display()
+                    )
+                })?);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = moves;
+    }
+    Ok(())
+}
+
+fn validate_public_move_identity(item: &DesktopOrganizeMove) -> Result<(), String> {
+    if !transfer_starts_on_public_desktop(&item.original) {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    {
+        let expected = item.public_identity.as_ref().ok_or_else(|| {
+            format!(
+                "recovery_required：公共桌面旧批次缺少文件身份，不能按裸路径放回：{}",
+                item.organized.display()
+            )
+        })?;
+        verify_desktop_organize_identity(&item.organized, expected).map_err(|error| {
+            format!("recovery_required：公共桌面待恢复项目已被替换或修改，已拒绝放回：{error}")
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        Err("当前系统不支持公共桌面恢复".to_string())
+    }
+}
+
+fn execute_transfers_with_public_approval(
+    transfers: &[(PathBuf, PathBuf, bool)],
+) -> Result<(), String> {
+    execute_transfers_with_public_approval_and_identities(transfers, None)
+}
+
+fn execute_transfers_with_public_approval_and_identities(
+    transfers: &[(PathBuf, PathBuf, bool)],
+    expected_identities: Option<&BTreeMap<String, DesktopOrganizeIdentity>>,
+) -> Result<(), String> {
+    let (public_transfers, regular_transfers): (Vec<_>, Vec<_>) = transfers
+        .iter()
+        .cloned()
+        .partition(|(source, destination, _)| transfer_touches_public_desktop(source, destination));
+    execute_transfers(&regular_transfers)?;
+    if let Err(error) = execute_permission_denied_transfers(&public_transfers, expected_identities)
+    {
+        let rollback = rollback_transfers(&regular_transfers);
+        return Err(match rollback {
+            Ok(()) => format!("公共桌面项目未获管理员批准，其他文件移动已回滚：{error}"),
+            Err(rollback_error) => {
+                format!("公共桌面项目未完成：{error}；个人桌面整理回滚同时失败：{rollback_error}")
+            }
+        });
     }
     Ok(())
 }
@@ -814,7 +2366,11 @@ fn rollback_exact_restores(restored_moves: &[DesktopOrganizeMove]) -> Result<(),
                 continue;
             }
         }
-        if let Err(error) = fs::rename(&item.original, &item.organized) {
+        if let Err(error) = execute_transfers_with_public_approval(&[(
+            item.original.clone(),
+            item.organized.clone(),
+            item.is_dir,
+        )]) {
             failures.push(format!(
                 "无法将 {} 回滚到 {}：{error}",
                 item.original.display(),
@@ -838,6 +2394,9 @@ fn ensure_restore_parent(
     if parent == index.desktop_path {
         return verify_or_create_directory(parent, created_directories);
     }
+    if public_desktop_path().is_some_and(|public| same_path(parent, &public)) {
+        return canonical_safe_restore_directory(parent);
+    }
     if parent == index.legacy_library_path {
         return verify_or_create_directory(parent, created_directories);
     }
@@ -848,6 +2407,15 @@ fn ensure_restore_parent(
         return verify_or_create_directory(parent, created_directories);
     }
     Err(format!("撤销目标不在授权目录内：{}", parent.display()))
+}
+
+fn canonical_safe_restore_directory(parent: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("撤销目录不可访问 {}：{error}", parent.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+        return Err(format!("撤销目录不是安全的普通目录：{}", parent.display()));
+    }
+    Ok(())
 }
 
 fn refresh_desktop_files(
@@ -1041,10 +2609,9 @@ fn organize_skipped_item(
 
 #[cfg(windows)]
 fn public_desktop_visible_paths() -> Vec<(String, PathBuf)> {
-    let Some(public_root) = std::env::var_os("PUBLIC") else {
+    let Some(public_desktop) = public_desktop_path() else {
         return Vec::new();
     };
-    let public_desktop = PathBuf::from(public_root).join("Desktop");
     let Ok(entries) = fs::read_dir(&public_desktop) else {
         return Vec::new();
     };
@@ -1072,23 +2639,127 @@ fn public_desktop_count() -> usize {
     public_desktop_visible_paths().len()
 }
 
-fn append_public_desktop_skips(
+fn include_public_desktop_requested(value: Option<bool>) -> bool {
+    value.unwrap_or(false)
+}
+
+fn public_organize_plan_snapshot(
+    plan: &OrganizePlan,
+) -> Result<(String, BTreeMap<String, DesktopOrganizeIdentity>), String> {
+    #[cfg(windows)]
+    {
+        let mut entries = plan
+            .candidates
+            .iter()
+            .map(|candidate| {
+                let identity = desktop_organize_identity(&candidate.original)?;
+                Ok((
+                    path_reservation_key(&candidate.original),
+                    candidate.is_dir,
+                    identity,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let identities = entries
+            .iter()
+            .map(|(path, _, identity)| (path.clone(), identity.clone()))
+            .collect();
+        let serialized = serde_json::to_vec(&entries)
+            .map_err(|error| format!("无法生成公共桌面确认快照：{error}"))?;
+        Ok((elevated_plan_digest(&serialized), identities))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = plan;
+        Err("当前系统不支持公共桌面确认快照".to_string())
+    }
+}
+
+fn append_public_desktop_plan(
     desktop: &Path,
-    skipped_items: &mut Vec<DesktopOrganizeSkippedItem>,
+    exclusion_keys: &HashSet<String>,
+    plan: &mut OrganizePlan,
 ) {
-    for (name, path) in public_desktop_visible_paths() {
+    for (display_name, path) in public_desktop_visible_paths() {
         if path
             .parent()
             .is_some_and(|parent| path_reservation_key(parent) == path_reservation_key(desktop))
         {
             continue;
         }
-        skipped_items.push(organize_skipped_item(
+        let name = path
+            .file_name()
+            .map(OsStr::to_os_string)
+            .unwrap_or_else(|| OsString::from(&display_name));
+        if is_wormhole_shortcut_name(&name) {
+            plan.skipped_items.push(organize_skipped_item(
+                display_name,
+                path.to_string_lossy().to_string(),
+                "wormhole_shortcut",
+                "这是虫洞派的桌面入口，会保留在桌面方便你重新打开",
+            ));
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                plan.skipped_items.push(organize_skipped_item(
+                    display_name,
+                    path.to_string_lossy().to_string(),
+                    "metadata_error",
+                    &format!("无法读取公共桌面项目属性：{error}"),
+                ));
+                continue;
+            }
+        };
+        let file_type = metadata.file_type();
+        if is_hidden_or_system(&name, &metadata) {
+            plan.skipped_items.push(organize_skipped_item(
+                display_name,
+                path.to_string_lossy().to_string(),
+                "protected_system_file",
+                "公共桌面的隐藏或系统文件已保护，不会移动",
+            ));
+            continue;
+        }
+        if file_type.is_symlink() || is_reparse_point(&metadata) {
+            plan.skipped_items.push(organize_skipped_item(
+                display_name,
+                path.to_string_lossy().to_string(),
+                "protected_link_or_cloud_placeholder",
+                "公共桌面的符号链接、重解析点或云端占位项目已保护；普通 .lnk/.url 快捷方式仍会正常整理",
+            ));
+            continue;
+        }
+        if !file_type.is_file() && !file_type.is_dir() {
+            plan.skipped_items.push(organize_skipped_item(
+                display_name,
+                path.to_string_lossy().to_string(),
+                "unsupported_type",
+                "公共桌面项目不是普通文件或文件夹，无法安全移动",
+            ));
+            continue;
+        }
+        let is_dir = file_type.is_dir();
+        if exclusion_keys.contains(&normalize_top_level_name(&name)) {
+            plan.excluded_count += 1;
+            plan.skipped_items.push(organize_skipped_item(
+                display_name,
+                path.to_string_lossy().to_string(),
+                "excluded_by_user",
+                "该公共桌面项目在你的整理忽略名单中，会继续留在桌面",
+            ));
+            continue;
+        }
+        let category = organize_category(&path, is_dir).to_string();
+        plan.categories.insert(category.clone());
+        plan.candidates.push(OrganizeCandidate {
+            original: path,
             name,
-            path.to_string_lossy().to_string(),
-            "public_desktop",
-            "这是所有 Windows 用户共享的公共桌面项目，为避免影响其他账户，虫洞派不会移动它",
-        ));
+            category,
+            is_dir,
+        });
     }
 }
 
@@ -1195,7 +2866,6 @@ fn collect_organize_plan(
         });
     }
 
-    append_public_desktop_skips(desktop, &mut plan.skipped_items);
     Ok(plan)
 }
 
@@ -1355,9 +3025,9 @@ fn program_search_roots(index: &SharedIndex) -> Vec<ProgramSearchRoot> {
         source: "桌面",
         recursive: false,
     });
-    if let Some(public_root) = std::env::var_os("PUBLIC") {
+    if let Some(public_desktop) = public_desktop_path() {
         roots.push(ProgramSearchRoot {
-            path: PathBuf::from(public_root).join("Desktop"),
+            path: public_desktop,
             source: "公共桌面",
             recursive: false,
         });
@@ -1728,6 +3398,39 @@ async fn recognize_speech_local() -> Result<String, String> {
     }
 }
 
+fn database_has_column(connection: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| error.to_string())?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| error.to_string())?;
+    for existing in columns {
+        if existing.map_err(|error| error.to_string())? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ensure_database_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    if database_has_column(connection, table, column)? {
+        return Ok(());
+    }
+    connection
+        .execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn init_database(connection: &Connection) -> Result<(), String> {
     connection
         .execute_batch(
@@ -1770,6 +3473,19 @@ fn init_database(connection: &Connection) -> Result<(), String> {
             );
             CREATE INDEX IF NOT EXISTS idx_organize_exclusions_created_at
                 ON organize_exclusions(created_at DESC);
+            CREATE TABLE IF NOT EXISTS social_accounts (
+                platform TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL DEFAULT '',
+                followers INTEGER NOT NULL DEFAULT 0,
+                unread_messages INTEGER NOT NULL DEFAULT 0,
+                unread_notifications INTEGER NOT NULL DEFAULT 0,
+                followers_source TEXT NOT NULL DEFAULT 'manual',
+                unread_messages_source TEXT NOT NULL DEFAULT 'manual',
+                unread_notifications_source TEXT NOT NULL DEFAULT 'manual',
+                account_identity TEXT NOT NULL DEFAULT '',
+                connected INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
             ",
         )
         .map_err(|error| error.to_string())?;
@@ -1827,6 +3543,1272 @@ fn init_database(connection: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|error| error.to_string())?;
+    ensure_database_column(
+        connection,
+        "social_accounts",
+        "followers_source",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    )?;
+    ensure_database_column(
+        connection,
+        "social_accounts",
+        "unread_messages_source",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    )?;
+    ensure_database_column(
+        connection,
+        "social_accounts",
+        "unread_notifications_source",
+        "TEXT NOT NULL DEFAULT 'manual'",
+    )?;
+    ensure_database_column(
+        connection,
+        "social_accounts",
+        "account_identity",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    // `connected` means that this app process verified a visible signed-in page.
+    // The Edge profile may still retain the login across restarts, but it must be
+    // verified again before the UI reports an active connection.
+    connection
+        .execute("UPDATE social_accounts SET connected = 0", [])
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocialRoute {
+    Home,
+    Publish,
+}
+
+const SOCIAL_METRIC_MANUAL: &str = "manual";
+const SOCIAL_METRIC_VISIBLE_PAGE: &str = "visible-page";
+const SOCIAL_METRIC_UNAVAILABLE: &str = "unavailable";
+
+#[derive(Debug)]
+struct StoredSocialSnapshotState {
+    connected: bool,
+    account_identity: String,
+    followers: u64,
+    followers_source: String,
+    unread_messages: u64,
+    unread_messages_source: String,
+    unread_notifications: u64,
+    unread_notifications_source: String,
+}
+
+fn normalize_saved_social_metric(
+    value: u64,
+    source: &str,
+    existing_value: u64,
+    existing_source: &str,
+) -> (u64, String) {
+    match source {
+        SOCIAL_METRIC_UNAVAILABLE => (0, SOCIAL_METRIC_UNAVAILABLE.to_string()),
+        SOCIAL_METRIC_VISIBLE_PAGE
+            if existing_source == SOCIAL_METRIC_VISIBLE_PAGE && value == existing_value =>
+        {
+            (value, SOCIAL_METRIC_VISIBLE_PAGE.to_string())
+        }
+        _ => (value, SOCIAL_METRIC_MANUAL.to_string()),
+    }
+}
+
+fn social_session_persistence() -> String {
+    "edge-profile".to_string()
+}
+
+fn social_route_url(platform: &str, route: SocialRoute) -> Result<&'static str, String> {
+    match (platform, route) {
+        ("xiaohongshu", SocialRoute::Home) => Ok("https://creator.xiaohongshu.com/"),
+        ("xiaohongshu", SocialRoute::Publish) => {
+            Ok("https://creator.xiaohongshu.com/publish/publish")
+        }
+        ("x", SocialRoute::Home) => Ok("https://x.com/home"),
+        ("x", SocialRoute::Publish) => Ok("https://x.com/compose/post"),
+        ("douyin", SocialRoute::Home) => Ok("https://creator.douyin.com/"),
+        ("douyin", SocialRoute::Publish) => {
+            Ok("https://creator.douyin.com/creator-micro/content/upload")
+        }
+        _ => Err("不支持的社交平台或页面".to_string()),
+    }
+}
+
+fn validate_social_platform(platform: &str) -> Result<(), String> {
+    social_route_url(platform, SocialRoute::Home).map(|_| ())
+}
+
+#[tauri::command]
+fn list_social_accounts(state: State<'_, AppState>) -> Result<Vec<SocialAccountSnapshot>, String> {
+    let connection = state
+        .index
+        .db
+        .lock()
+        .map_err(|_| "数据库正忙".to_string())?;
+    let mut statement = connection
+        .prepare(
+            "SELECT platform, display_name, followers, unread_messages, unread_notifications,
+                followers_source, unread_messages_source, unread_notifications_source,
+                account_identity, connected, updated_at
+         FROM social_accounts ORDER BY platform",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SocialAccountSnapshot {
+                platform: row.get(0)?,
+                display_name: row.get(1)?,
+                followers: row.get(2)?,
+                unread_messages: row.get(3)?,
+                unread_notifications: row.get(4)?,
+                followers_source: row.get(5)?,
+                unread_messages_source: row.get(6)?,
+                unread_notifications_source: row.get(7)?,
+                account_identity: row.get(8)?,
+                connected: row.get::<_, i64>(9)? != 0,
+                updated_at: row.get(10)?,
+                session_persistence: social_session_persistence(),
+                raw_cookie_accessed: false,
+            })
+        })
+        .map_err(|error| error.to_string())?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn save_social_snapshot(
+    mut snapshot: SocialAccountSnapshot,
+    state: State<'_, AppState>,
+) -> Result<SocialAccountSnapshot, String> {
+    validate_social_platform(&snapshot.platform)?;
+    snapshot.display_name = snapshot.display_name.trim().chars().take(80).collect();
+    snapshot.updated_at = now_millis() / 1_000;
+    snapshot.session_persistence = social_session_persistence();
+    snapshot.raw_cookie_accessed = false;
+    let connection = state
+        .index
+        .db
+        .lock()
+        .map_err(|_| "数据库正忙".to_string())?;
+    let existing = connection
+        .query_row(
+            "SELECT connected, account_identity,
+                    followers, followers_source,
+                    unread_messages, unread_messages_source,
+                    unread_notifications, unread_notifications_source
+             FROM social_accounts WHERE platform = ?1",
+            [&snapshot.platform],
+            |row| {
+                Ok(StoredSocialSnapshotState {
+                    connected: row.get::<_, i64>(0)? != 0,
+                    account_identity: row.get(1)?,
+                    followers: row.get(2)?,
+                    followers_source: row.get(3)?,
+                    unread_messages: row.get(4)?,
+                    unread_messages_source: row.get(5)?,
+                    unread_notifications: row.get(6)?,
+                    unread_notifications_source: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| StoredSocialSnapshotState {
+            connected: false,
+            account_identity: String::new(),
+            followers: 0,
+            followers_source: SOCIAL_METRIC_UNAVAILABLE.to_string(),
+            unread_messages: 0,
+            unread_messages_source: SOCIAL_METRIC_UNAVAILABLE.to_string(),
+            unread_notifications: 0,
+            unread_notifications_source: SOCIAL_METRIC_UNAVAILABLE.to_string(),
+        });
+    snapshot.connected = existing.connected;
+    snapshot.account_identity = existing.account_identity;
+    (snapshot.followers, snapshot.followers_source) = normalize_saved_social_metric(
+        snapshot.followers,
+        &snapshot.followers_source,
+        existing.followers,
+        &existing.followers_source,
+    );
+    (snapshot.unread_messages, snapshot.unread_messages_source) = normalize_saved_social_metric(
+        snapshot.unread_messages,
+        &snapshot.unread_messages_source,
+        existing.unread_messages,
+        &existing.unread_messages_source,
+    );
+    (
+        snapshot.unread_notifications,
+        snapshot.unread_notifications_source,
+    ) = normalize_saved_social_metric(
+        snapshot.unread_notifications,
+        &snapshot.unread_notifications_source,
+        existing.unread_notifications,
+        &existing.unread_notifications_source,
+    );
+    connection.execute(
+        "INSERT INTO social_accounts (
+             platform, display_name, followers, unread_messages, unread_notifications,
+             followers_source, unread_messages_source, unread_notifications_source,
+             account_identity, connected, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(platform) DO UPDATE SET display_name=excluded.display_name, followers=excluded.followers,
+         unread_messages=excluded.unread_messages, unread_notifications=excluded.unread_notifications,
+         followers_source=excluded.followers_source,
+         unread_messages_source=excluded.unread_messages_source,
+         unread_notifications_source=excluded.unread_notifications_source,
+         account_identity=excluded.account_identity, connected=excluded.connected,
+         updated_at=excluded.updated_at",
+        params![
+            snapshot.platform,
+            snapshot.display_name,
+            snapshot.followers,
+            snapshot.unread_messages,
+            snapshot.unread_notifications,
+            snapshot.followers_source,
+            snapshot.unread_messages_source,
+            snapshot.unread_notifications_source,
+            snapshot.account_identity,
+            i64::from(snapshot.connected),
+            snapshot.updated_at
+        ],
+    ).map_err(|error| error.to_string())?;
+    Ok(snapshot)
+}
+
+#[cfg(windows)]
+fn social_profile_root(app: &tauri::AppHandle, platform: &str) -> Result<PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map_err(|error| error.to_string())
+        .map(|root| root.join("browser-sessions").join(platform))
+}
+
+#[cfg(windows)]
+fn owned_windows_handle(handle: HANDLE) -> OwnedHandle {
+    unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) }
+}
+
+#[cfg(windows)]
+fn create_inheritable_windows_pipe() -> Result<(OwnedHandle, OwnedHandle), String> {
+    let mut read_handle: HANDLE = std::ptr::null_mut();
+    let mut write_handle: HANDLE = std::ptr::null_mut();
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    if unsafe { CreatePipe(&mut read_handle, &mut write_handle, &attributes, 0) } == 0 {
+        return Err(format!(
+            "无法创建托管 Edge 调试管道：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok((
+        owned_windows_handle(read_handle),
+        owned_windows_handle(write_handle),
+    ))
+}
+
+#[cfg(windows)]
+fn set_windows_handle_inheritable(handle: &OwnedHandle, inheritable: bool) -> Result<(), String> {
+    let flags = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
+    if unsafe { SetHandleInformation(handle.as_raw_handle() as HANDLE, HANDLE_FLAG_INHERIT, flags) }
+        == 0
+    {
+        return Err(format!(
+            "无法限制托管 Edge 管道句柄：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn serialize_windows_handle(handle: &OwnedHandle) -> Result<u32, String> {
+    u32::try_from(handle.as_raw_handle() as usize)
+        .map_err(|_| "托管 Edge 管道句柄超出浏览器支持范围".to_string())
+}
+
+#[cfg(windows)]
+fn append_windows_command_argument(command_line: &mut Vec<u16>, argument: &OsStr) {
+    if !command_line.is_empty() {
+        command_line.push(b' ' as u16);
+    }
+    let units = argument.encode_wide().collect::<Vec<_>>();
+    let needs_quotes = units.is_empty()
+        || units
+            .iter()
+            .any(|unit| *unit == b' ' as u16 || *unit == b'\t' as u16 || *unit == b'"' as u16);
+    if !needs_quotes {
+        command_line.extend(units);
+        return;
+    }
+
+    command_line.push(b'"' as u16);
+    let mut backslashes = 0usize;
+    for unit in units {
+        if unit == b'\\' as u16 {
+            backslashes += 1;
+            continue;
+        }
+        if unit == b'"' as u16 {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2 + 1));
+            command_line.push(unit);
+        } else {
+            command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes));
+            command_line.push(unit);
+        }
+        backslashes = 0;
+    }
+    command_line.extend(std::iter::repeat_n(b'\\' as u16, backslashes * 2));
+    command_line.push(b'"' as u16);
+}
+
+#[cfg(windows)]
+fn build_windows_command_line(executable: &Path, arguments: &[OsString]) -> Vec<u16> {
+    let mut command_line = Vec::new();
+    append_windows_command_argument(&mut command_line, executable.as_os_str());
+    for argument in arguments {
+        append_windows_command_argument(&mut command_line, argument);
+    }
+    command_line.push(0);
+    command_line
+}
+
+#[cfg(windows)]
+fn create_social_process_job() -> Result<OwnedHandle, String> {
+    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if handle.is_null() {
+        return Err(format!(
+            "无法创建托管 Edge 生命周期容器：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let job = owned_windows_handle(handle);
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle() as HANDLE,
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        return Err(format!(
+            "无法限制托管 Edge 生命周期：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(job)
+}
+
+#[cfg(windows)]
+fn read_social_cdp_messages(
+    output: fs::File,
+    sender: std::sync::mpsc::Sender<Result<serde_json::Value, String>>,
+) {
+    let mut reader = BufReader::new(output);
+    loop {
+        let mut message = Vec::new();
+        let result = (&mut reader)
+            .take((SOCIAL_CDP_MAX_MESSAGE_BYTES + 1) as u64)
+            .read_until(0, &mut message);
+        match result {
+            Ok(0) => {
+                let _ = sender.send(Err("托管 Edge 调试管道已关闭".to_string()));
+                break;
+            }
+            Ok(_) if message.last() != Some(&0) => {
+                let _ = sender.send(Err("托管 Edge 返回的调试消息过大".to_string()));
+                break;
+            }
+            Ok(_) => {
+                message.pop();
+                if message.is_empty() {
+                    continue;
+                }
+                match serde_json::from_slice(&message) {
+                    Ok(value) => {
+                        if sender.send(Ok(value)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(format!("托管 Edge 返回了无效数据：{error}")));
+                        break;
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(Err(format!("无法读取托管 Edge：{error}")));
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl ManagedSocialSession {
+    fn is_running(&self) -> bool {
+        (unsafe { WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 0) }) == WAIT_TIMEOUT
+    }
+
+    fn write_request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        session_id: Option<&str>,
+    ) -> Result<u64, String> {
+        let id = self.next_command_id;
+        self.next_command_id = self.next_command_id.saturating_add(1);
+        let mut request = serde_json::json!({
+            "id": id,
+            "method": method,
+            "params": params,
+        });
+        if let Some(session_id) = session_id {
+            request["sessionId"] = serde_json::Value::String(session_id.to_string());
+        }
+        let serialized = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+        let input = self
+            .command_input
+            .as_mut()
+            .ok_or_else(|| "托管 Edge 调试管道已经关闭".to_string())?;
+        input
+            .write_all(&serialized)
+            .and_then(|_| input.write_all(&[0]))
+            .and_then(|_| input.flush())
+            .map_err(|error| format!("无法向托管 Edge 发送命令：{error}"))?;
+        Ok(id)
+    }
+
+    fn send_command_with_timeout(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        session_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, String> {
+        if !self.is_running() {
+            return Err(format!("{} 托管 Edge 已关闭", self.platform));
+        }
+        let id = self.write_request(method, params, session_id)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| format!("托管 Edge 命令超时：{method}"))?;
+            match self.responses.recv_timeout(remaining) {
+                Ok(Ok(response)) => {
+                    if response.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+                        continue;
+                    }
+                    if let Some(message) = response
+                        .pointer("/error/message")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        return Err(format!("托管 Edge 命令失败：{message}"));
+                    }
+                    return Ok(response);
+                }
+                Ok(Err(error)) => return Err(error),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!("托管 Edge 命令超时：{method}"));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("托管 Edge 调试管道已经断开".to_string());
+                }
+            }
+        }
+    }
+
+    fn send_command(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+        session_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.send_command_with_timeout(method, params, session_id, SOCIAL_CDP_COMMAND_TIMEOUT)
+    }
+
+    fn shutdown(&mut self) {
+        if self.is_running() {
+            let _ = self.write_request("Browser.close", serde_json::json!({}), None);
+        }
+        self.command_input.take();
+        let wait = unsafe {
+            WaitForSingleObject(
+                self.process.as_raw_handle() as HANDLE,
+                SOCIAL_EDGE_SHUTDOWN_TIMEOUT_MS,
+            )
+        };
+        if wait != WAIT_OBJECT_0 {
+            unsafe {
+                TerminateJobObject(self.job.as_raw_handle() as HANDLE, 1);
+                WaitForSingleObject(self.process.as_raw_handle() as HANDLE, 2_000);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ManagedSocialSession {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+#[cfg(windows)]
+fn launch_managed_social_session(
+    executable: &Path,
+    profile_root: &Path,
+    platform: &str,
+    initial_url: &str,
+) -> Result<ManagedSocialSession, String> {
+    fs::create_dir_all(profile_root).map_err(|error| format!("无法创建登录会话目录：{error}"))?;
+    for (path, label) in [
+        (profile_root.parent(), "托管 Edge Profile 根目录"),
+        (Some(profile_root), "托管 Edge Profile 目录"),
+    ] {
+        let path = path.ok_or_else(|| format!("无法定位{label}"))?;
+        let metadata =
+            fs::symlink_metadata(path).map_err(|error| format!("无法检查{label}：{error}"))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            return Err(format!("拒绝使用异常的{label}"));
+        }
+    }
+
+    let (child_input, parent_input) = create_inheritable_windows_pipe()?;
+    let (parent_output, child_output) = create_inheritable_windows_pipe()?;
+    set_windows_handle_inheritable(&parent_input, false)?;
+    set_windows_handle_inheritable(&parent_output, false)?;
+    let child_input_value = serialize_windows_handle(&child_input)?;
+    let child_output_value = serialize_windows_handle(&child_output)?;
+
+    let arguments = vec![
+        OsString::from(format!("--user-data-dir={}", profile_root.display())),
+        OsString::from("--remote-debugging-pipe"),
+        OsString::from(format!(
+            "--remote-debugging-io-pipes={child_input_value},{child_output_value}"
+        )),
+        OsString::from("--no-first-run"),
+        OsString::from("--no-default-browser-check"),
+        OsString::from("--disable-background-mode"),
+        OsString::from("--new-window"),
+        OsString::from(initial_url),
+    ];
+    let executable_wide = wide_null(executable.as_os_str());
+    let mut command_line = build_windows_command_line(executable, &arguments);
+    let job = create_social_process_job()?;
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+    let created = unsafe {
+        CreateProcessW(
+            executable_wide.as_ptr(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            CREATE_SUSPENDED,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(format!(
+            "无法打开托管登录窗口：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let process_handle = owned_windows_handle(process.hProcess);
+    let thread_handle = owned_windows_handle(process.hThread);
+    if unsafe {
+        AssignProcessToJobObject(
+            job.as_raw_handle() as HANDLE,
+            process_handle.as_raw_handle() as HANDLE,
+        )
+    } == 0
+    {
+        unsafe {
+            TerminateJobObject(job.as_raw_handle() as HANDLE, 1);
+        }
+        return Err(format!(
+            "无法接管托管 Edge 生命周期：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if unsafe { ResumeThread(thread_handle.as_raw_handle() as HANDLE) } == u32::MAX {
+        unsafe {
+            TerminateJobObject(job.as_raw_handle() as HANDLE, 1);
+        }
+        return Err(format!(
+            "无法启动托管 Edge：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    drop(thread_handle);
+    drop(child_input);
+    drop(child_output);
+
+    let input = unsafe { fs::File::from_raw_handle(parent_input.into_raw_handle()) };
+    let output = unsafe { fs::File::from_raw_handle(parent_output.into_raw_handle()) };
+    let (sender, responses) = std::sync::mpsc::channel();
+    thread::spawn(move || read_social_cdp_messages(output, sender));
+
+    Ok(ManagedSocialSession {
+        platform: platform.to_string(),
+        process: process_handle,
+        job,
+        command_input: Some(input),
+        responses,
+        next_command_id: 1,
+        active_target_id: None,
+    })
+}
+
+#[cfg(windows)]
+fn social_host_matches(platform: &str, page_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(page_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port_or_known_default() != Some(443)
+    {
+        return false;
+    }
+    match platform {
+        "xiaohongshu" => host == "xiaohongshu.com" || host.ends_with(".xiaohongshu.com"),
+        "x" => host == "x.com" || host.ends_with(".x.com"),
+        "douyin" => host == "douyin.com" || host.ends_with(".douyin.com"),
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn matching_social_targets(platform: &str, targets: &[CdpTargetInfo]) -> Vec<CdpTargetInfo> {
+    targets
+        .iter()
+        .filter(|target| target.target_type == "page" && social_host_matches(platform, &target.url))
+        .cloned()
+        .collect()
+}
+
+#[cfg(windows)]
+fn select_unique_social_target(
+    platform: &str,
+    targets: &[CdpTargetInfo],
+) -> Result<CdpTargetInfo, String> {
+    let matches = matching_social_targets(platform, targets);
+    match matches.as_slice() {
+        [target] => Ok(target.clone()),
+        [] => Err("没有找到该平台的托管页面，请先打开托管会话并完成登录。".to_string()),
+        _ => Err(
+            "检测到多个该平台页面，无法确认要读取的账号。请只保留一个托管页面后重试。".to_string(),
+        ),
+    }
+}
+
+#[cfg(windows)]
+impl ManagedSocialSession {
+    fn target_infos(&mut self) -> Result<Vec<CdpTargetInfo>, String> {
+        let response = self.send_command("Target.getTargets", serde_json::json!({}), None)?;
+        let targets = response
+            .pointer("/result/targetInfos")
+            .cloned()
+            .ok_or_else(|| "托管 Edge 没有返回页面列表".to_string())?;
+        serde_json::from_value(targets).map_err(|error| error.to_string())
+    }
+
+    fn create_target(&mut self, url: &str) -> Result<String, String> {
+        let response = self.send_command(
+            "Target.createTarget",
+            serde_json::json!({ "url": url }),
+            None,
+        )?;
+        response
+            .pointer("/result/targetId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "托管 Edge 没有创建目标页面".to_string())
+    }
+
+    fn attach_target(&mut self, target_id: &str) -> Result<String, String> {
+        let response = self.send_command(
+            "Target.attachToTarget",
+            serde_json::json!({ "targetId": target_id, "flatten": true }),
+            None,
+        )?;
+        response
+            .pointer("/result/sessionId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "无法连接托管 Edge 页面".to_string())
+    }
+
+    fn detach_target(&mut self, session_id: &str) {
+        let _ = self.send_command(
+            "Target.detachFromTarget",
+            serde_json::json!({ "sessionId": session_id }),
+            None,
+        );
+    }
+
+    fn navigate_target(&mut self, target_id: &str, url: &str) -> Result<(), String> {
+        let session_id = self.attach_target(target_id)?;
+        let result = self.send_command(
+            "Page.navigate",
+            serde_json::json!({ "url": url }),
+            Some(&session_id),
+        );
+        self.detach_target(&session_id);
+        let response = result?;
+        if let Some(error) = response
+            .pointer("/result/errorText")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            return Err(format!("托管页面没有打开：{error}"));
+        }
+        self.active_target_id = Some(target_id.to_string());
+        Ok(())
+    }
+
+    fn open_route(&mut self, platform: &str, url: &str) -> Result<(), String> {
+        let targets = self.target_infos()?;
+        let active = self.active_target_id.as_ref().and_then(|active_id| {
+            targets
+                .iter()
+                .find(|target| target.target_type == "page" && target.target_id == *active_id)
+                .map(|target| target.target_id.clone())
+        });
+        let target_id = if let Some(active) = active {
+            active
+        } else {
+            let matches = matching_social_targets(platform, &targets);
+            match matches.as_slice() {
+                [target] => target.target_id.clone(),
+                [] => self.create_target(url)?,
+                _ => {
+                    return Err(
+                        "检测到多个该平台页面，无法确认托管窗口。请只保留一个页面后重试。"
+                            .to_string(),
+                    )
+                }
+            }
+        };
+        self.navigate_target(&target_id, url)
+    }
+
+    fn wait_for_initial_target(&mut self, platform: &str) -> Result<(), String> {
+        let deadline = Instant::now() + SOCIAL_CDP_COMMAND_TIMEOUT;
+        loop {
+            match self.target_infos() {
+                Ok(targets) => {
+                    let matches = matching_social_targets(platform, &targets);
+                    match matches.as_slice() {
+                        [target] => {
+                            self.active_target_id = Some(target.target_id.clone());
+                            return Ok(());
+                        }
+                        [] if Instant::now() < deadline => {}
+                        [] => return Err("托管 Edge 已启动，但目标页面没有就绪".to_string()),
+                        _ => {
+                            return Err("托管 Edge 启动了多个目标页面，无法确认受控页面".to_string())
+                        }
+                    }
+                }
+                Err(_) if Instant::now() < deadline => {}
+                Err(error) => return Err(error),
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+#[cfg(windows)]
+fn visible_social_metrics_expression(platform: &str) -> Result<String, String> {
+    let platform_json = serde_json::to_string(platform).map_err(|error| error.to_string())?;
+    let script = r#"(() => {
+  const platform = __PLATFORM__;
+  const visible = (element) => {
+    if (!element) return false;
+    const style = getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  };
+  const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const firstElement = (selectors, root = document) => {
+    for (const selector of selectors) {
+      for (const element of root.querySelectorAll(selector)) {
+        if (visible(element)) return element;
+      }
+    }
+    return null;
+  };
+  const elementText = (element) => clean(element && (element.getAttribute("aria-label") || element.textContent));
+  const count = (value) => {
+    const text = clean(value).replace(/,/g, "");
+    const match = text.match(/(\d+(?:\.\d+)?)\s*(亿|万|[KMB])?/i);
+    if (!match) return null;
+    const multiplier = { "万": 10000, "亿": 100000000, "K": 1000, "M": 1000000, "B": 1000000000 }[String(match[2] || "").toUpperCase()] || 1;
+    const result = Math.round(Number(match[1]) * multiplier);
+    return Number.isSafeInteger(result) && result >= 0 ? result : null;
+  };
+  const firstText = (selectors, root = document) => {
+    const element = firstElement(selectors, root);
+    const value = elementText(element);
+    return value && value.length <= 120 ? value : null;
+  };
+  const countMetric = (selectors) => {
+    const element = firstElement(selectors);
+    return { confirmed: Boolean(element), value: element ? count(elementText(element)) : null };
+  };
+  const labeledCountMetric = (labels) => {
+    const selectors = "[class*='stat'],[class*='data'],[class*='fans'],[class*='follow'],[class*='count'],[class*='number'],a[aria-label],button[aria-label]";
+    for (const element of document.querySelectorAll(selectors)) {
+      if (!visible(element)) continue;
+      const value = elementText(element);
+      if (!value || value.length > 100 || !labels.some((label) => value.toLowerCase().includes(label.toLowerCase()))) continue;
+      const parsed = count(value);
+      if (parsed !== null) return { confirmed: true, value: parsed };
+    }
+    return { confirmed: false, value: null };
+  };
+  const unreadMetric = (surfaceSelectors, badgeSelectors) => {
+    const surface = firstElement(surfaceSelectors);
+    if (!surface) return { confirmed: false, value: null };
+    const badgeText = firstText(badgeSelectors, surface);
+    const badgeValue = badgeText === null ? null : count(badgeText);
+    if (badgeValue !== null) return { confirmed: true, value: badgeValue };
+    const surfaceText = clean(surface.getAttribute("aria-label") || surface.getAttribute("title"));
+    if (/unread|未读/i.test(surfaceText)) {
+      const surfaceValue = count(surfaceText);
+      if (surfaceValue !== null) return { confirmed: true, value: surfaceValue };
+    }
+    return { confirmed: true, value: 0 };
+  };
+  const configurations = {
+    x: {
+      name: ["[data-testid='SideNav_AccountSwitcher_Button'] [dir='ltr'] span", "[data-testid='UserName'] span"],
+      account: ["[data-testid='SideNav_AccountSwitcher_Button']"],
+      followers: ["a[href$='/followers']", "a[href$='/verified_followers']"],
+      messageSurface: ["a[href='/messages']", "a[href^='/messages/']"],
+      notificationSurface: ["a[href='/notifications']", "a[href^='/notifications/']"],
+      badges: ["[data-testid='badge']", "[aria-label*='unread' i]", "[class*='badge']", "[class*='count']"],
+      followerLabels: ["followers", "粉丝"]
+    },
+    xiaohongshu: {
+      name: ["[class*='userName']", "[class*='username']", "[class*='nickname']", "[class*='user-name']"],
+      followers: ["[class*='fans'] [class*='count']", "[class*='follower'] [class*='count']", "[class*='fans']"],
+      messageSurface: ["a[href*='message']", "button[class*='message']", "[class*='message-entry']", "[class*='messageEntry']", "[class*='im-entry']"],
+      notificationSurface: ["a[href*='notice']", "a[href*='notification']", "button[class*='notice']", "[class*='notice-entry']", "[class*='notification-entry']"],
+      badges: ["[class*='badge']", "[class*='count']", "[aria-label*='未读']", "[aria-label*='unread' i]"],
+      followerLabels: ["粉丝", "followers"]
+    },
+    douyin: {
+      name: ["[class*='userName']", "[class*='username']", "[class*='nickname']", "[class*='account-name']"],
+      followers: ["[class*='fans'] [class*='count']", "[class*='follower'] [class*='count']", "[class*='fans']"],
+      messageSurface: ["a[href*='message']", "button[class*='message']", "[class*='message-entry']", "[class*='messageEntry']", "[class*='im-entry']"],
+      notificationSurface: ["a[href*='notice']", "a[href*='notification']", "button[class*='notice']", "[class*='notice-entry']", "[class*='notification-entry']"],
+      badges: ["[class*='badge']", "[class*='count']", "[aria-label*='未读']", "[aria-label*='unread' i]"],
+      followerLabels: ["粉丝", "followers"]
+    }
+  };
+  const configuration = configurations[platform];
+  if (!configuration) return JSON.stringify({});
+  const displayName = firstText(configuration.name);
+  const directFollowers = countMetric(configuration.followers);
+  const followers = directFollowers.confirmed ? directFollowers : labeledCountMetric(configuration.followerLabels);
+  const messages = unreadMetric(configuration.messageSurface, configuration.badges);
+  const notifications = unreadMetric(configuration.notificationSurface, configuration.badges);
+  let pageConfirmed = Boolean(displayName);
+  let accountIdentity = displayName;
+  if (platform === "x") {
+    const accountElement = firstElement(configuration.account);
+    const accountText = clean(accountElement && `${accountElement.getAttribute("aria-label") || ""} ${accountElement.textContent || ""}`);
+    const handleMatch = accountText.match(/@([A-Za-z0-9_]+)/);
+    const accountHandle = handleMatch ? handleMatch[1].toLowerCase() : null;
+    const firstPath = location.pathname.split("/").filter(Boolean)[0] || "home";
+    const reserved = new Set(["home", "notifications", "messages", "compose", "explore", "search", "settings", "i"]);
+    pageConfirmed = Boolean(accountHandle) && (reserved.has(firstPath.toLowerCase()) || firstPath.toLowerCase() === accountHandle);
+    accountIdentity = accountHandle ? `@${accountHandle}` : null;
+  }
+  const selectorsConfirmed = Boolean(displayName) && (followers.confirmed || messages.confirmed || notifications.confirmed);
+  return JSON.stringify({
+    pageConfirmed,
+    selectorsConfirmed,
+    displayName,
+    accountIdentity,
+    followers: followers.value,
+    followersConfirmed: followers.confirmed,
+    unreadMessages: messages.value,
+    messagesConfirmed: messages.confirmed,
+    unreadNotifications: notifications.value,
+    notificationsConfirmed: notifications.confirmed
+  });
+})()"#;
+    Ok(script.replace("__PLATFORM__", &platform_json))
+}
+
+#[cfg(windows)]
+fn evaluate_visible_social_metrics(
+    session: &mut ManagedSocialSession,
+    target_id: &str,
+    platform: &str,
+) -> Result<VisibleSocialMetrics, String> {
+    let expression = visible_social_metrics_expression(platform)?;
+    let page_session_id = session.attach_target(target_id)?;
+    let response = session.send_command(
+        "Runtime.evaluate",
+        serde_json::json!({
+            "expression": expression,
+            "returnByValue": true,
+            "awaitPromise": false
+        }),
+        Some(&page_session_id),
+    );
+    session.detach_target(&page_session_id);
+    let response = response?;
+    if let Some(description) = response
+        .pointer("/result/exceptionDetails/text")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Err(format!("页面可见数据读取失败：{description}"));
+    }
+    let value = response
+        .pointer("/result/result/value")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "页面没有返回可见汇总数据".to_string())?;
+    serde_json::from_str(value).map_err(|error| error.to_string())
+}
+
+fn save_social_snapshot_to_index(
+    index: &SharedIndex,
+    snapshot: &SocialAccountSnapshot,
+) -> Result<(), String> {
+    let connection = index.db.lock().map_err(|_| "数据库正忙".to_string())?;
+    connection.execute(
+        "INSERT INTO social_accounts (
+             platform, display_name, followers, unread_messages, unread_notifications,
+             followers_source, unread_messages_source, unread_notifications_source,
+             account_identity, connected, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(platform) DO UPDATE SET display_name=excluded.display_name, followers=excluded.followers,
+         unread_messages=excluded.unread_messages, unread_notifications=excluded.unread_notifications,
+         followers_source=excluded.followers_source,
+         unread_messages_source=excluded.unread_messages_source,
+         unread_notifications_source=excluded.unread_notifications_source,
+         account_identity=excluded.account_identity, connected=excluded.connected,
+         updated_at=excluded.updated_at",
+        params![
+            snapshot.platform,
+            snapshot.display_name,
+            snapshot.followers,
+            snapshot.unread_messages,
+            snapshot.unread_notifications,
+            snapshot.followers_source,
+            snapshot.unread_messages_source,
+            snapshot.unread_notifications_source,
+            snapshot.account_identity,
+            i64::from(snapshot.connected),
+            snapshot.updated_at
+        ],
+    ).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn update_social_connection(
+    index: &SharedIndex,
+    platform: &str,
+    connected: bool,
+) -> Result<(), String> {
+    let connection = index.db.lock().map_err(|_| "数据库正忙".to_string())?;
+    connection
+        .execute(
+            "UPDATE social_accounts SET connected = ?2, updated_at = ?3 WHERE platform = ?1",
+            params![platform, i64::from(connected), now_millis() / 1_000],
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn controlled_social_target(
+    session: &mut ManagedSocialSession,
+    platform: &str,
+) -> Result<CdpTargetInfo, String> {
+    let targets = session.target_infos()?;
+    if let Some(active_target_id) = session.active_target_id.as_deref() {
+        let active = targets
+            .iter()
+            .find(|target| target.target_type == "page" && target.target_id == active_target_id)
+            .ok_or_else(|| "受控社交页面已经关闭，请重新打开托管会话。".to_string())?;
+        if !social_host_matches(platform, &active.url) {
+            return Err("受控社交页面已离开对应平台，拒绝读取其他页面。".to_string());
+        }
+        return Ok(active.clone());
+    }
+    let target = select_unique_social_target(platform, &targets)?;
+    session.active_target_id = Some(target.target_id.clone());
+    Ok(target)
+}
+
+#[cfg(windows)]
+fn open_managed_social_route(
+    app: &tauri::AppHandle,
+    platform: &str,
+    route: SocialRoute,
+    state: &AppState,
+) -> Result<bool, String> {
+    let url = social_route_url(platform, route)?;
+    let edge = find_edge_executable()
+        .ok_or_else(|| "未找到 Microsoft Edge，无法创建托管登录会话".to_string())?;
+    let profile_root = social_profile_root(app, platform)?;
+    let mut sessions = state
+        .social_sessions
+        .lock()
+        .map_err(|_| "托管浏览器状态正忙".to_string())?;
+    if sessions
+        .get(platform)
+        .is_some_and(|session| !session.is_running())
+    {
+        sessions.remove(platform);
+    }
+    if let Some(session) = sessions.get_mut(platform) {
+        session.open_route(platform, url)?;
+        return Ok(false);
+    }
+    let mut session = launch_managed_social_session(&edge, &profile_root, platform, url)?;
+    session.wait_for_initial_target(platform)?;
+    sessions.insert(platform.to_string(), session);
+    Ok(true)
+}
+
+#[tauri::command]
+fn sync_social_snapshot(
+    platform: String,
+    state: State<'_, AppState>,
+) -> Result<SocialAccountSnapshot, String> {
+    validate_social_platform(&platform)?;
+    #[cfg(not(windows))]
+    {
+        let _ = state;
+        Err("当前系统暂不支持托管浏览器可见数据同步".to_string())
+    }
+    #[cfg(windows)]
+    {
+        let metrics_result = (|| {
+            let mut sessions = state
+                .social_sessions
+                .lock()
+                .map_err(|_| "托管浏览器状态正忙".to_string())?;
+            let session = sessions.get_mut(&platform).ok_or_else(|| {
+                "没有运行中的托管会话。请先打开该平台，并在 Edge Profile 中完成登录。".to_string()
+            })?;
+            if !session.is_running() {
+                return Err("托管 Edge 已关闭，请重新打开该平台。".to_string());
+            }
+            let target = controlled_social_target(session, &platform)?;
+            evaluate_visible_social_metrics(session, &target.target_id, &platform)
+        })();
+        let metrics = match metrics_result {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                let _ = update_social_connection(&state.index, &platform, false);
+                return Err(error);
+            }
+        };
+        let display_name = metrics
+            .display_name
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().chars().take(80).collect::<String>());
+        let account_identity = metrics
+            .account_identity
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.trim().chars().take(120).collect::<String>());
+        if !metrics.page_confirmed
+            || !metrics.selectors_confirmed
+            || display_name.is_none()
+            || account_identity.is_none()
+        {
+            let _ = update_social_connection(&state.index, &platform, false);
+            return Err(
+                "当前受控页面没有验证出已登录账号。请在托管 Edge 窗口中完成登录，并打开账号主页或创作者数据页。"
+                    .to_string(),
+            );
+        }
+        let metric = |value: Option<u64>, confirmed: bool| {
+            if confirmed {
+                value
+                    .map(|value| (value, SOCIAL_METRIC_VISIBLE_PAGE.to_string()))
+                    .unwrap_or_else(|| (0, SOCIAL_METRIC_UNAVAILABLE.to_string()))
+            } else {
+                (0, SOCIAL_METRIC_UNAVAILABLE.to_string())
+            }
+        };
+        let (followers, followers_source) = metric(metrics.followers, metrics.followers_confirmed);
+        let (unread_messages, unread_messages_source) =
+            metric(metrics.unread_messages, metrics.messages_confirmed);
+        let (unread_notifications, unread_notifications_source) = metric(
+            metrics.unread_notifications,
+            metrics.notifications_confirmed,
+        );
+        let snapshot = SocialAccountSnapshot {
+            platform,
+            display_name: display_name.unwrap_or_default(),
+            followers,
+            unread_messages,
+            unread_notifications,
+            followers_source,
+            unread_messages_source,
+            unread_notifications_source,
+            account_identity: account_identity.unwrap_or_default(),
+            connected: true,
+            updated_at: now_millis() / 1_000,
+            session_persistence: social_session_persistence(),
+            raw_cookie_accessed: false,
+        };
+        save_social_snapshot_to_index(&state.index, &snapshot)?;
+        append_log(
+            &state.index,
+            "sync_social_snapshot",
+            None,
+            &snapshot.platform,
+            "visible_summary_only",
+        );
+        Ok(snapshot)
+    }
+}
+
+#[cfg(windows)]
+fn find_edge_executable() -> Option<PathBuf> {
+    [
+        std::env::var_os("PROGRAMFILES(X86)").map(PathBuf::from),
+        std::env::var_os("PROGRAMFILES").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|root| root.join("Microsoft/Edge/Application/msedge.exe"))
+    .find(|path| path.is_file())
+}
+
+#[tauri::command]
+fn open_social_session(
+    app: tauri::AppHandle,
+    platform: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    validate_social_platform(&platform)?;
+    #[cfg(windows)]
+    {
+        if open_managed_social_route(&app, &platform, SocialRoute::Home, &state)? {
+            update_social_connection(&state.index, &platform, false)?;
+        }
+    }
+    #[cfg(not(windows))]
+    open::that(social_route_url(&platform, SocialRoute::Home)?)
+        .map_err(|error| error.to_string())?;
+    append_log(
+        &state.index,
+        "open_social_session",
+        None,
+        &platform,
+        "success",
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn disconnect_social_session(platform: String, state: State<'_, AppState>) -> Result<(), String> {
+    validate_social_platform(&platform)?;
+    #[cfg(windows)]
+    {
+        let session = state
+            .social_sessions
+            .lock()
+            .map_err(|_| "托管浏览器状态正忙".to_string())?
+            .remove(&platform);
+        drop(session);
+    }
+    update_social_connection(&state.index, &platform, false)?;
+    append_log(
+        &state.index,
+        "disconnect_social_session",
+        None,
+        &platform,
+        "profile_retained",
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_social_session(
+    app: tauri::AppHandle,
+    platform: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    validate_social_platform(&platform)?;
+    #[cfg(windows)]
+    {
+        let session = state
+            .social_sessions
+            .lock()
+            .map_err(|_| "托管浏览器状态正忙".to_string())?
+            .remove(&platform);
+        drop(session);
+        let profile_root = social_profile_root(&app, &platform)?;
+        match fs::symlink_metadata(&profile_root) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || is_reparse_point(&metadata)
+                {
+                    return Err("拒绝清理异常的托管 Edge Profile 目录".to_string());
+                }
+                fs::remove_dir_all(&profile_root)
+                    .map_err(|error| format!("无法清理托管 Edge Profile：{error}"))?;
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("无法检查托管 Edge Profile：{error}")),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+    let connection = state
+        .index
+        .db
+        .lock()
+        .map_err(|_| "数据库正忙".to_string())?;
+    connection
+        .execute(
+            "DELETE FROM social_accounts WHERE platform = ?1",
+            [&platform],
+        )
+        .map_err(|error| error.to_string())?;
+    drop(connection);
+    append_log(
+        &state.index,
+        "clear_social_session",
+        None,
+        &platform,
+        "edge_profile_deleted",
+    );
     Ok(())
 }
 
@@ -2333,12 +5315,121 @@ fn get_organize_state(state: State<'_, AppState>) -> Result<OrganizeState, Strin
     Ok(OrganizeState {
         can_undo: !batches.is_empty(),
         batch_count: batches.len(),
+        latest_batch_touches_public_desktop: batches
+            .last()
+            .is_some_and(batch_touches_public_desktop),
     })
+}
+
+#[tauri::command]
+fn request_public_desktop_confirmation(
+    action: String,
+    batch_id: Option<String>,
+    move_ids: Option<Vec<String>>,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if window.label() != "main" {
+        return Err("公共桌面二次确认只能由主窗口发起".to_string());
+    }
+    #[cfg(windows)]
+    {
+        let batches = state
+            .organize_batches
+            .lock()
+            .map_err(|_| "桌面整理历史已锁定".to_string())?;
+        let requested_move_ids = normalized_confirmation_move_ids(move_ids.unwrap_or_default());
+        let mut organize_snapshot_digest = None;
+        let (bound_batch_id, bound_move_ids) = match action.as_str() {
+            PUBLIC_DESKTOP_ACTION_ORGANIZE => {
+                if batch_id.is_some() || !requested_move_ids.is_empty() {
+                    return Err("公共桌面收纳确认参数无效".to_string());
+                }
+                let desktop = state
+                    .index
+                    .desktop_path
+                    .canonicalize()
+                    .map_err(|error| format!("桌面目录不可访问：{error}"))?;
+                let exclusion_keys = load_organize_exclusion_keys(&state.index)?;
+                let mut plan = OrganizePlan {
+                    candidates: Vec::new(),
+                    categories: BTreeSet::new(),
+                    excluded_count: 0,
+                    skipped_items: Vec::new(),
+                };
+                append_public_desktop_plan(&desktop, &exclusion_keys, &mut plan);
+                organize_snapshot_digest = Some(public_organize_plan_snapshot(&plan)?.0);
+                (None, Vec::new())
+            }
+            PUBLIC_DESKTOP_ACTION_UNDO => {
+                let batch = batches
+                    .last()
+                    .ok_or_else(|| "没有可以撤销的桌面整理记录".to_string())?;
+                if !batch_touches_public_desktop(batch) {
+                    return Err("最近一批整理不需要公共桌面确认".to_string());
+                }
+                if batch_id
+                    .as_deref()
+                    .is_some_and(|requested| requested != batch.batch_id)
+                {
+                    return Err("公共桌面撤销批次已变化，请重新确认".to_string());
+                }
+                (Some(batch.batch_id.clone()), Vec::new())
+            }
+            PUBLIC_DESKTOP_ACTION_REVIEW => {
+                let batch_id = batch_id
+                    .as_deref()
+                    .ok_or_else(|| "公共桌面复查缺少批次".to_string())?;
+                let batch = batches
+                    .iter()
+                    .find(|batch| batch.batch_id == batch_id)
+                    .ok_or_else(|| "整理批次不存在或已经撤销".to_string())?;
+                if requested_move_ids.is_empty() {
+                    return Err("公共桌面复查没有选择待放回项目".to_string());
+                }
+                let known = batch
+                    .moves
+                    .iter()
+                    .map(|item| item.move_id.as_str())
+                    .collect::<HashSet<_>>();
+                if requested_move_ids
+                    .iter()
+                    .any(|move_id| !known.contains(move_id.as_str()))
+                {
+                    return Err("公共桌面复查选择已变化，请重新确认".to_string());
+                }
+                if !batch.moves.iter().any(|item| {
+                    requested_move_ids.contains(&item.move_id)
+                        && transfer_starts_on_public_desktop(&item.original)
+                }) {
+                    return Err("所选复查项目不涉及公共桌面".to_string());
+                }
+                (Some(batch.batch_id.clone()), requested_move_ids)
+            }
+            _ => return Err("不支持的公共桌面确认操作".to_string()),
+        };
+        drop(batches);
+        issue_public_desktop_confirmation(
+            &state.public_desktop_confirmations,
+            &action,
+            bound_batch_id,
+            bound_move_ids,
+            organize_snapshot_digest,
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (action, batch_id, move_ids, state);
+        Err("当前系统不支持公共桌面操作".to_string())
+    }
 }
 
 #[tauri::command]
 fn organize_desktop(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    include_public_desktop: Option<bool>,
+    confirmation_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<DesktopOrganizeResult, String> {
     let _operation_guard = state
@@ -2358,14 +5449,48 @@ fn organize_desktop(
     let organize_root = state.index.library_path.clone();
     let legacy_root = state.index.legacy_library_path.clone();
     let exclusion_keys = load_organize_exclusion_keys(&state.index)?;
-    let mut plan = collect_organize_plan(&desktop, &exclusion_keys)?;
-    append_legacy_library_plan(&legacy_root, &mut plan);
+    let organize_public_desktop = include_public_desktop_requested(include_public_desktop);
+    if organize_public_desktop && window.label() != "main" {
+        return Err("公共桌面收纳只能由主窗口在明确确认后发起".to_string());
+    }
+    let mut plan = if organize_public_desktop {
+        OrganizePlan {
+            candidates: Vec::new(),
+            categories: BTreeSet::new(),
+            excluded_count: 0,
+            skipped_items: Vec::new(),
+        }
+    } else {
+        collect_organize_plan(&desktop, &exclusion_keys)?
+    };
+    let mut expected_public_identities = None;
+    if organize_public_desktop {
+        append_public_desktop_plan(&desktop, &exclusion_keys, &mut plan);
+        #[cfg(windows)]
+        {
+            let (snapshot_digest, identities) = public_organize_plan_snapshot(&plan)?;
+            consume_public_desktop_confirmation(
+                &state.public_desktop_confirmations,
+                confirmation_token.as_deref(),
+                PUBLIC_DESKTOP_ACTION_ORGANIZE,
+                None,
+                Vec::new(),
+                Some(&snapshot_digest),
+            )?;
+            expected_public_identities = Some(identities);
+        }
+        #[cfg(not(windows))]
+        return Err("当前系统不支持公共桌面操作".to_string());
+    } else {
+        append_legacy_library_plan(&legacy_root, &mut plan);
+    }
     let skipped_count = plan.skipped_items.len();
-    let public_desktop_count = public_desktop_count();
 
     if plan.candidates.is_empty() {
-        let legacy_directories = legacy_cleanup_directories(&legacy_root);
-        let _ = remove_created_directories(&legacy_directories);
+        if !organize_public_desktop {
+            let legacy_directories = legacy_cleanup_directories(&legacy_root);
+            let _ = remove_created_directories(&legacy_directories);
+        }
         let indexed_count = scan_index(&state.index, true)?.len();
         append_log(
             &state.index,
@@ -2377,6 +5502,8 @@ fn organize_desktop(
         return Ok(DesktopOrganizeResult {
             moved_count: 0,
             new_moved_count: 0,
+            personal_moved_count: 0,
+            public_moved_count: 0,
             migrated_count: 0,
             category_count: 0,
             skipped_count,
@@ -2386,7 +5513,7 @@ fn organize_desktop(
             excluded_count: plan.excluded_count,
             skipped_items: plan.skipped_items,
             indexed_count,
-            public_desktop_count,
+            public_desktop_count: public_desktop_count(),
         });
     }
 
@@ -2432,6 +5559,7 @@ fn organize_desktop(
             organized,
             category: candidate.category,
             is_dir: candidate.is_dir,
+            public_identity: None,
         });
     }
 
@@ -2439,13 +5567,31 @@ fn organize_desktop(
         .iter()
         .map(|item| (item.original.clone(), item.organized.clone(), item.is_dir))
         .collect::<Vec<_>>();
-    if let Err(error) = execute_transfers(&transfers) {
+    if let Err(error) = execute_transfers_with_public_approval_and_identities(
+        &transfers,
+        expected_public_identities.as_ref(),
+    ) {
         let cleanup_error = remove_created_directories(&created_directories).err();
         let _ = refresh_desktop_files(&app, &state.index);
         return Err(match cleanup_error {
             Some(cleanup_error) => format!("{error}；清理失败：{cleanup_error}"),
             None => error,
         });
+    }
+
+    if let Err(error) = capture_public_move_identities(&mut moves) {
+        let rollback_error = rollback_transfers(&transfers).err();
+        let cleanup_error = remove_created_directories(&created_directories).err();
+        let _ = refresh_desktop_files(&app, &state.index);
+        return Err(format!(
+            "{error}{}{}",
+            rollback_error
+                .map(|value| format!("；文件回滚失败：{value}"))
+                .unwrap_or_default(),
+            cleanup_error
+                .map(|value| format!("；新库清理失败：{value}"))
+                .unwrap_or_default()
+        ));
     }
 
     if let Err(error) = repath_index_transfers(&state.index, &transfers) {
@@ -2464,7 +5610,11 @@ fn organize_desktop(
     }
     let reverse_index_transfers = reversed_transfers(&transfers);
 
-    let legacy_directories = legacy_cleanup_directories(&legacy_root);
+    let legacy_directories = if organize_public_desktop {
+        Vec::new()
+    } else {
+        legacy_cleanup_directories(&legacy_root)
+    };
     let removed_legacy_directories = match remove_created_directories(&legacy_directories) {
         Ok(removed) => removed,
         Err(error) => {
@@ -2564,15 +5714,28 @@ fn organize_desktop(
     };
 
     let moved_count = moves.len();
-    let new_moved_count = moves
+    let personal_moved_count = moves
         .iter()
-        .filter(|item| item.original.parent() == Some(desktop.as_path()))
+        .filter(|item| {
+            item.original
+                .parent()
+                .is_some_and(|parent| same_path(parent, &desktop))
+        })
         .count();
+    let public_moved_count = moves
+        .iter()
+        .filter(|item| transfer_starts_on_public_desktop(&item.original))
+        .count();
+    let new_moved_count = personal_moved_count + public_moved_count;
     let migrated_count = moved_count.saturating_sub(new_moved_count);
     let category_count = plan.categories.len();
     let items = moves
         .iter()
-        .filter(|item| item.original.parent() == Some(desktop.as_path()))
+        .filter(|item| {
+            item.original
+                .parent()
+                .is_some_and(|parent| is_desktop_source_parent(parent, &desktop))
+        })
         .map(organize_item)
         .collect();
     append_log(
@@ -2586,6 +5749,8 @@ fn organize_desktop(
     Ok(DesktopOrganizeResult {
         moved_count,
         new_moved_count,
+        personal_moved_count,
+        public_moved_count,
         migrated_count,
         category_count,
         skipped_count,
@@ -2595,7 +5760,7 @@ fn organize_desktop(
         excluded_count: plan.excluded_count,
         skipped_items: plan.skipped_items,
         indexed_count: indexed_files.len(),
-        public_desktop_count,
+        public_desktop_count: public_desktop_count(),
     })
 }
 
@@ -2604,6 +5769,8 @@ fn review_desktop_organize(
     batch_id: String,
     excluded_move_ids: Vec<String>,
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    confirmation_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<DesktopOrganizeReviewResult, String> {
     let _operation_guard = state
@@ -2652,6 +5819,48 @@ fn review_desktop_organize(
     {
         return Err("排除选择包含不属于当前整理批次的项目".to_string());
     }
+    let selected_touches_public = batch.moves.iter().any(|item| {
+        requested_ids.contains(&item.move_id) && transfer_starts_on_public_desktop(&item.original)
+    });
+    if selected_touches_public {
+        if window.label() != "main" {
+            return Err("公共桌面复查只能由主窗口在明确确认后发起".to_string());
+        }
+        #[cfg(windows)]
+        consume_public_desktop_confirmation(
+            &state.public_desktop_confirmations,
+            confirmation_token.as_deref(),
+            PUBLIC_DESKTOP_ACTION_REVIEW,
+            Some(&batch.batch_id),
+            requested_ids.iter().cloned().collect(),
+            None,
+        )?;
+        #[cfg(not(windows))]
+        return Err("当前系统不支持公共桌面复查".to_string());
+    }
+
+    let mut expected_public_identities = BTreeMap::new();
+    for item in batch.moves.iter().filter(|item| {
+        requested_ids.contains(&item.move_id) && transfer_starts_on_public_desktop(&item.original)
+    }) {
+        let Ok(metadata) = fs::symlink_metadata(&item.organized) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink()
+            || is_reparse_point(&metadata)
+            || metadata.is_dir() != item.is_dir
+            || (!metadata.is_file() && !metadata.is_dir())
+        {
+            continue;
+        }
+        validate_public_move_identity(item)?;
+        expected_public_identities.insert(
+            path_reservation_key(&item.organized),
+            item.public_identity
+                .clone()
+                .ok_or_else(|| "recovery_required：公共桌面批次缺少已确认身份".to_string())?,
+        );
+    }
 
     let mut candidate_rules = BTreeMap::<String, (String, String, bool)>::new();
     for item in batch
@@ -2659,7 +5868,10 @@ fn review_desktop_organize(
         .iter()
         .filter(|item| requested_ids.contains(&item.move_id))
     {
-        if item.original.parent() != Some(desktop.as_path())
+        if !item
+            .original
+            .parent()
+            .is_some_and(|parent| is_desktop_source_parent(parent, &desktop))
             || !item.organized.starts_with(&batch.root)
         {
             return Err("整理记录包含授权目录之外的项目，已拒绝复核".to_string());
@@ -2717,7 +5929,11 @@ fn review_desktop_organize(
             conflict_count += 1;
             continue;
         }
-        match fs::rename(&item.organized, &item.original) {
+        let transfer = [(item.organized.clone(), item.original.clone(), item.is_dir)];
+        let expected_identities = transfer_starts_on_public_desktop(&item.original)
+            .then_some(&expected_public_identities);
+        match execute_transfers_with_public_approval_and_identities(&transfer, expected_identities)
+        {
             Ok(()) => {
                 restored_ids.insert(item.move_id.clone());
                 restored_moves.push(item.clone());
@@ -2935,6 +6151,8 @@ fn remove_organize_exclusion(name_key: String, state: State<'_, AppState>) -> Re
 #[tauri::command]
 fn undo_desktop_organize(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    confirmation_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<DesktopOrganizeResult, String> {
     let _operation_guard = state
@@ -2949,6 +6167,23 @@ fn undo_desktop_organize(
         .last()
         .cloned()
         .ok_or_else(|| "没有可以撤销的桌面整理记录".to_string())?;
+    let undo_touches_public = batch_touches_public_desktop(&batch);
+    if undo_touches_public {
+        if window.label() != "main" {
+            return Err("公共桌面撤销只能由主窗口在明确确认后发起".to_string());
+        }
+        #[cfg(windows)]
+        consume_public_desktop_confirmation(
+            &state.public_desktop_confirmations,
+            confirmation_token.as_deref(),
+            PUBLIC_DESKTOP_ACTION_UNDO,
+            Some(&batch.batch_id),
+            Vec::new(),
+            None,
+        )?;
+        #[cfg(not(windows))]
+        return Err("当前系统不支持公共桌面撤销".to_string());
+    }
 
     let expected_root = state.index.library_path.clone();
     if batch.root != expected_root {
@@ -2966,6 +6201,31 @@ fn undo_desktop_organize(
         Ok(_) => {}
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => return Err(format!("无法检查整理根目录：{error}")),
+    }
+
+    let mut expected_public_identities = BTreeMap::new();
+    for item in batch
+        .moves
+        .iter()
+        .filter(|item| transfer_starts_on_public_desktop(&item.original))
+    {
+        let Ok(metadata) = fs::symlink_metadata(&item.organized) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink()
+            || is_reparse_point(&metadata)
+            || metadata.is_dir() != item.is_dir
+            || (!metadata.is_file() && !metadata.is_dir())
+        {
+            continue;
+        }
+        validate_public_move_identity(item)?;
+        expected_public_identities.insert(
+            path_reservation_key(&item.organized),
+            item.public_identity
+                .clone()
+                .ok_or_else(|| "recovery_required：公共桌面批次缺少已确认身份".to_string())?,
+        );
     }
 
     let mut reserved = HashSet::new();
@@ -3003,6 +6263,7 @@ fn undo_desktop_organize(
         };
         if metadata.file_type().is_symlink()
             || is_reparse_point(&metadata)
+            || metadata.is_dir() != item.is_dir
             || (!metadata.is_file() && !metadata.is_dir())
         {
             skipped_items.push(organize_skipped_item(
@@ -3057,7 +6318,10 @@ fn undo_desktop_organize(
         restored_categories.insert(item.category.clone());
     }
 
-    if let Err(error) = execute_transfers(&restore_transfers) {
+    if let Err(error) = execute_transfers_with_public_approval_and_identities(
+        &restore_transfers,
+        undo_touches_public.then_some(&expected_public_identities),
+    ) {
         let _ = remove_created_directories(&created_restore_directories);
         let _ = refresh_desktop_files(&app, &state.index);
         return Err(error);
@@ -3107,7 +6371,24 @@ fn undo_desktop_organize(
 
     let previous_batches = batches.clone();
     let mut next_batches = previous_batches.clone();
-    next_batches.pop();
+    let restored_move_ids = restored_items
+        .iter()
+        .map(|item| item.move_id.as_str())
+        .collect::<HashSet<_>>();
+    let remove_empty_batch = if let Some(remaining_batch) = next_batches.last_mut() {
+        remaining_batch
+            .moves
+            .retain(|item| !restored_move_ids.contains(item.move_id.as_str()));
+        remaining_batch
+            .created_directories
+            .retain(|directory| directory.exists());
+        remaining_batch.moves.is_empty()
+    } else {
+        false
+    };
+    if remove_empty_batch {
+        next_batches.pop();
+    }
     if let Err(error) = persist_organize_batches(&state.index, &next_batches) {
         let recreate_error = recreate_removed_directories(&removed_directories).err();
         let rollback_error = rollback_transfers(&restore_transfers).err();
@@ -3172,6 +6453,19 @@ fn undo_desktop_organize(
     };
 
     let moved_count = restore_transfers.len();
+    let personal_moved_count = restore_transfers
+        .iter()
+        .filter(|(_, destination, _)| {
+            destination
+                .parent()
+                .is_some_and(|parent| same_path(parent, &state.index.desktop_path))
+        })
+        .count();
+    let public_moved_count = restore_transfers
+        .iter()
+        .filter(|(_, destination, _)| transfer_starts_on_public_desktop(destination))
+        .count();
+    let new_moved_count = personal_moved_count + public_moved_count;
     let category_count = restored_categories.len();
     let skipped_count = skipped_items.len();
     append_log(
@@ -3184,8 +6478,10 @@ fn undo_desktop_organize(
 
     Ok(DesktopOrganizeResult {
         moved_count,
-        new_moved_count: moved_count,
-        migrated_count: 0,
+        new_moved_count,
+        personal_moved_count,
+        public_moved_count,
+        migrated_count: moved_count.saturating_sub(new_moved_count),
         category_count,
         skipped_count,
         root_path: batch.root.to_string_lossy().to_string(),
@@ -4698,7 +7994,70 @@ fn select_agent_default_workspace(
     ensure_dedicated_agent_workspace(&documents.join("虫洞派 Agent 工作区"))
 }
 
-fn agent_task_arguments(kind: AgentConnectorKind, task: &str) -> Vec<OsString> {
+fn valid_agent_app_session_id(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.len() <= 160
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
+fn valid_provider_session_id(kind: AgentConnectorKind, value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_whitespace) {
+        return false;
+    }
+    match kind {
+        AgentConnectorKind::Claude => {
+            value.len() == 36
+                && value.chars().enumerate().all(|(index, character)| {
+                    if matches!(index, 8 | 13 | 18 | 23) {
+                        character == '-'
+                    } else {
+                        character.is_ascii_hexdigit()
+                    }
+                })
+        }
+        AgentConnectorKind::Hermes => value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-')),
+        AgentConnectorKind::Codex => false,
+    }
+}
+
+fn new_claude_provider_session_id() -> String {
+    let digest = Sha256::digest(
+        format!(
+            "wormhole-claude:{}:{}:{}",
+            now_millis(),
+            std::process::id(),
+            AGENT_TASK_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        )
+        .as_bytes(),
+    );
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!(
+        "{}-{}-4{}-a{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[13..16],
+        &hex[17..20],
+        &hex[20..32]
+    )
+}
+
+fn agent_task_arguments(
+    kind: AgentConnectorKind,
+    task: &str,
+    provider_session_id: Option<&str>,
+) -> Vec<OsString> {
+    let provider_session_id = provider_session_id
+        .map(str::trim)
+        .filter(|value| valid_provider_session_id(kind, value));
     match kind {
         AgentConnectorKind::Codex => [
             "--ask-for-approval",
@@ -4715,34 +8074,65 @@ fn agent_task_arguments(kind: AgentConnectorKind, task: &str) -> Vec<OsString> {
         .into_iter()
         .map(OsString::from)
         .collect(),
-        AgentConnectorKind::Claude => [
-            "--print",
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "acceptEdits",
-            "--no-session-persistence",
-            "--no-chrome",
-            "--",
-            task,
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect(),
-        AgentConnectorKind::Hermes => [
-            "chat",
-            "-Q",
-            "--checkpoints",
-            "--max-turns",
-            "24",
-            "--source",
-            "tool",
-            "-q",
-            task,
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect(),
+        AgentConnectorKind::Claude => {
+            let mut arguments = [
+                "--print",
+                "--output-format",
+                "json",
+                "--permission-mode",
+                "acceptEdits",
+                "--no-chrome",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+            if let Some(session_id) = provider_session_id {
+                arguments.push(OsString::from("--resume"));
+                arguments.push(OsString::from(session_id));
+            } else {
+                arguments.push(OsString::from("--session-id"));
+                arguments.push(OsString::from(new_claude_provider_session_id()));
+            }
+            arguments.push(OsString::from("--"));
+            arguments.push(OsString::from(task));
+            arguments
+        }
+        AgentConnectorKind::Hermes => {
+            let mut arguments = [
+                "chat",
+                "-Q",
+                "--checkpoints",
+                "--max-turns",
+                "24",
+                "--source",
+                "tool",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+            if let Some(session_id) = provider_session_id {
+                arguments.push(OsString::from("--resume"));
+                arguments.push(OsString::from(session_id));
+            }
+            arguments.push(OsString::from("-q"));
+            arguments.push(OsString::from(task));
+            arguments
+        }
+    }
+}
+
+fn resolved_provider_session_id(
+    kind: AgentConnectorKind,
+    provider_session_id: Option<&str>,
+) -> Option<String> {
+    let existing = provider_session_id
+        .map(str::trim)
+        .filter(|value| valid_provider_session_id(kind, value))
+        .map(str::to_string);
+    match kind {
+        AgentConnectorKind::Claude => existing.or_else(|| Some(new_claude_provider_session_id())),
+        AgentConnectorKind::Hermes => existing,
+        AgentConnectorKind::Codex => None,
     }
 }
 
@@ -4897,19 +8287,117 @@ fn request_agent_task_cancellation(
     Ok(Some(task.status.clone()))
 }
 
-fn agent_task_public_output(result: &BoundedProcessOutput) -> String {
+fn agent_task_failure_message(kind: AgentConnectorKind, stderr: &str) -> String {
+    let normalized = stderr.to_ascii_lowercase();
+    if normalized.contains("selected model")
+        || normalized.contains("model may not exist")
+        || normalized.contains("model_not_found")
+        || normalized.contains("unknown model")
+    {
+        return format!(
+            "{} 当前模型不可用或账号无权访问，请在 Agent 管理中检查模型配置。",
+            kind.name()
+        );
+    }
+    if normalized.contains("unauthorized")
+        || normalized.contains("authentication")
+        || normalized.contains("invalid api key")
+        || normalized.contains("invalid x-api-key")
+        || normalized.contains("status code 401")
+    {
+        return format!("{} 认证失败，请在 Agent 管理中检查 API 密钥。", kind.name());
+    }
+    if normalized.contains("connection refused")
+        || normalized.contains("econnrefused")
+        || normalized.contains("failed to connect")
+        || normalized.contains("network error")
+        || normalized.contains("dns")
+    {
+        return format!(
+            "{} 无法连接 API 地址，请检查网络和 Agent API 地址。",
+            kind.name()
+        );
+    }
+    "本机 Agent 没有完成任务，请检查连接状态或稍后再试。".to_string()
+}
+
+fn agent_task_failure_code(
+    kind: AgentConnectorKind,
+    result: &BoundedProcessOutput,
+) -> Option<AgentTaskFailureCode> {
+    if result.success || result.cancelled || result.timed_out {
+        return None;
+    }
+    let normalized = format!("{}\n{}", result.stdout, result.stderr).to_ascii_lowercase();
+    Some(
+        if normalized.contains("session")
+            && (normalized.contains("not found") || normalized.contains("unknown"))
+        {
+            AgentTaskFailureCode::SessionNotFound
+        } else if normalized.contains("unauthorized")
+            || normalized.contains("authentication")
+            || normalized.contains("invalid api key")
+            || normalized.contains("status code 401")
+        {
+            AgentTaskFailureCode::Authentication
+        } else if normalized.contains("quota")
+            || normalized.contains("rate limit")
+            || normalized.contains("status code 429")
+        {
+            AgentTaskFailureCode::Quota
+        } else if normalized.contains("model")
+            && (normalized.contains("not found")
+                || normalized.contains("unavailable")
+                || normalized.contains("no access"))
+        {
+            AgentTaskFailureCode::ModelUnavailable
+        } else if normalized.contains("permission denied")
+            || normalized.contains("access is denied")
+        {
+            AgentTaskFailureCode::Permission
+        } else if normalized.contains("connection")
+            || normalized.contains("network")
+            || normalized.contains("dns")
+        {
+            AgentTaskFailureCode::Network
+        } else {
+            let _ = kind;
+            AgentTaskFailureCode::ExitFailure
+        },
+    )
+}
+
+fn agent_task_public_output(
+    kind: AgentConnectorKind,
+    result: &BoundedProcessOutput,
+) -> (String, Option<String>) {
     if result.success {
         if result.stdout.is_empty() {
-            "任务已完成，连接器没有返回文字结果。".to_string()
-        } else {
-            result.stdout.clone()
+            return ("任务已完成，连接器没有返回文字结果。".to_string(), None);
         }
+        if kind == AgentConnectorKind::Claude {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&result.stdout) {
+                let output = value
+                    .get("result")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(&result.stdout)
+                    .to_string();
+                let session_id = value
+                    .get("session_id")
+                    .or_else(|| value.get("sessionId"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| valid_provider_session_id(kind, value))
+                    .map(str::to_string);
+                return (output, session_id);
+            }
+        }
+        (result.stdout.clone(), None)
     } else if result.cancelled {
-        "任务已由用户停止。".to_string()
+        ("任务已由用户停止。".to_string(), None)
     } else if result.timed_out {
-        "任务达到长时运行安全上限，已经安全停止。".to_string()
+        ("任务达到长时运行安全上限，已经安全停止。".to_string(), None)
     } else {
-        "本机 Agent 没有完成任务，请检查连接状态或稍后再试。".to_string()
+        (agent_task_failure_message(kind, &result.stderr), None)
     }
 }
 
@@ -4919,10 +8407,17 @@ fn execute_agent_task(
     task: String,
     workspace: String,
     attachment_paths: Option<Vec<String>>,
+    app_session_id: String,
+    provider_session_id: Option<String>,
 ) -> Result<AgentTaskResult, String> {
     let kind = AgentConnectorKind::from_id(&connector_id)
         .ok_or_else(|| "仅支持 codex、claude 或 hermes 连接器".to_string())?;
     let task = validate_agent_task(&task)?;
+    let app_session_id = app_session_id.trim().to_string();
+    if !valid_agent_app_session_id(&app_session_id) {
+        return Err("Agent 应用会话标识无效".to_string());
+    }
+    let provider_session_id = resolved_provider_session_id(kind, provider_session_id.as_deref());
     let workspace = validate_agent_workspace(&workspace)?;
     let connector = resolve_agent_connector_cached(kind, false);
     let executable = connector
@@ -4936,7 +8431,7 @@ fn execute_agent_task(
         prepare_agent_attachments(&workspace, attachment_paths.unwrap_or_default(), &task_id)?;
     let task = compose_agent_task_with_attachments(&task, &attachments);
     let (task_id, cancellation) = begin_agent_task(&app, kind, task_id)?;
-    let arguments = agent_task_arguments(kind, &task);
+    let arguments = agent_task_arguments(kind, &task, provider_session_id.as_deref());
     let heartbeat_app = app.clone();
     let heartbeat_task_id = task_id.clone();
     let result = run_bounded_process_with_control(
@@ -4968,10 +8463,17 @@ fn execute_agent_task(
             let result = AgentTaskResult {
                 task_id,
                 connector_id: kind.id().to_string(),
+                app_session_id,
                 success: false,
                 timed_out: false,
                 cancelled: false,
                 output,
+                failure_code: Some(if error.permission_denied {
+                    AgentTaskFailureCode::Permission
+                } else {
+                    AgentTaskFailureCode::ProcessLaunch
+                }),
+                provider_session_id,
                 exit_code: None,
                 duration_ms: elapsed_ms,
                 truncated: false,
@@ -4983,15 +8485,20 @@ fn execute_agent_task(
     };
     let final_state = completed_agent_task_state(&result);
     finish_agent_task(&app, &task_id, final_state, result.duration_ms);
-    let output = agent_task_public_output(&result);
+    let failure_code = agent_task_failure_code(kind, &result);
+    let (output, returned_provider_session_id) = agent_task_public_output(kind, &result);
+    let provider_session_id = returned_provider_session_id.or(provider_session_id);
     let (output, files) = extract_agent_result_files(&output, &workspace);
     let task_result = AgentTaskResult {
         task_id,
         connector_id: kind.id().to_string(),
+        app_session_id,
         success: result.success,
         timed_out: result.timed_out,
         cancelled: result.cancelled,
         output,
+        failure_code,
+        provider_session_id,
         exit_code: result.exit_code,
         duration_ms: result.duration_ms,
         truncated: result.truncated,
@@ -5163,7 +8670,7 @@ fn install_dependency(kind: AgentConnectorKind) -> Result<bool, String> {
                 }
             ));
         }
-        return Ok(true);
+        Ok(true)
     }
 
     #[cfg(target_os = "macos")]
@@ -5594,11 +9101,22 @@ async fn save_agent_api_config(config: AgentApiConfig) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn pick_dialogue_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+fn pick_dialogue_files(
+    app: tauri::AppHandle,
+    locale: Option<String>,
+) -> Result<Vec<String>, String> {
+    let english = locale
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("en-US"));
+    let title = if english {
+        "Choose files for the Agent"
+    } else {
+        "选择要交给 Agent 的文件"
+    };
     let files = app
         .dialog()
         .file()
-        .set_title("选择要交给 Agent 的文件")
+        .set_title(title)
         .blocking_pick_files()
         .unwrap_or_default();
     files
@@ -5606,7 +9124,13 @@ fn pick_dialogue_files(app: tauri::AppHandle) -> Result<Vec<String>, String> {
         .map(|file| {
             file.into_path()
                 .map(|path| path.to_string_lossy().to_string())
-                .map_err(|_| "只支持选择本机文件".to_string())
+                .map_err(|_| {
+                    if english {
+                        "Only local files can be selected".to_string()
+                    } else {
+                        "只支持选择本机文件".to_string()
+                    }
+                })
         })
         .collect()
 }
@@ -5665,9 +9189,19 @@ async fn run_agent_task(
     task: String,
     workspace: String,
     attachment_paths: Option<Vec<String>>,
+    app_session_id: String,
+    provider_session_id: Option<String>,
 ) -> Result<AgentTaskResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        execute_agent_task(app, connector_id, task, workspace, attachment_paths)
+        execute_agent_task(
+            app,
+            connector_id,
+            task,
+            workspace,
+            attachment_paths,
+            app_session_id,
+            provider_session_id,
+        )
     })
     .await
     .map_err(|error| format!("Agent 执行任务异常：{error}"))?
@@ -5707,32 +9241,111 @@ fn open_agent_result_file(path: String, workspace: String) -> Result<(), String>
 }
 
 #[tauri::command]
-fn open_social(platform: String, state: State<'_, AppState>) -> Result<(), String> {
-    let url = match platform.as_str() {
-        "xiaohongshu" => "https://creator.xiaohongshu.com/publish/publish",
-        "x" => "https://x.com/compose/post",
-        "douyin" => "https://creator.douyin.com/creator-micro/content/upload",
-        _ => return Err("不支持的社交平台".to_string()),
-    };
-
-    open::that(url).map_err(|error| error.to_string())?;
-    append_log(&state.index, "open_social", None, url, "success");
+fn open_social(
+    app: tauri::AppHandle,
+    platform: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    validate_social_platform(&platform)?;
+    #[cfg(windows)]
+    {
+        if open_managed_social_route(&app, &platform, SocialRoute::Publish, &state)? {
+            update_social_connection(&state.index, &platform, false)?;
+        }
+    }
+    #[cfg(not(windows))]
+    open::that(social_route_url(&platform, SocialRoute::Publish)?)
+        .map_err(|error| error.to_string())?;
+    append_log(
+        &state.index,
+        "open_social",
+        None,
+        &platform,
+        "managed_profile",
+    );
     Ok(())
+}
+
+fn sensitive_url_query_name(name: &str) -> bool {
+    let normalized = name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "authorization"
+            | "auth"
+            | "apikey"
+            | "password"
+            | "passwd"
+            | "secret"
+            | "clientsecret"
+            | "credential"
+            | "credentials"
+            | "cookie"
+            | "session"
+            | "sessionid"
+            | "jwt"
+            | "signature"
+            | "sig"
+            | "code"
+            | "state"
+    )
+}
+
+fn sanitized_external_url(value: &str) -> Result<(url::Url, String), String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 2048 || value.chars().any(char::is_control) {
+        return Err("链接为空、过长或包含控制字符".to_string());
+    }
+    let mut parsed = url::Url::parse(value).map_err(|_| "链接格式无效".to_string())?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err("只支持有效的 HTTPS 链接".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("链接不能包含用户名或密码".to_string());
+    }
+    let retained_query = parsed
+        .query_pairs()
+        .filter(|(name, _)| !sensitive_url_query_name(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    parsed.set_query(None);
+    if !retained_query.is_empty() {
+        let mut query = parsed.query_pairs_mut();
+        for (name, value) in retained_query {
+            query.append_pair(&name, &value);
+        }
+    }
+    parsed.set_fragment(None);
+    let safe_log_target = format!(
+        "{}{}",
+        parsed.origin().ascii_serialization(),
+        if parsed.path().is_empty() {
+            "/"
+        } else {
+            parsed.path()
+        }
+    );
+    Ok((parsed, safe_log_target))
 }
 
 #[tauri::command]
 fn open_external_url(url: String, state: State<'_, AppState>) -> Result<(), String> {
-    let value = url.trim();
-    let lower = value.to_ascii_lowercase();
-    if value.is_empty()
-        || value.len() > 2048
-        || value.chars().any(char::is_control)
-        || !(lower.starts_with("https://") || lower.starts_with("http://"))
-    {
-        return Err("只支持安全的 http 或 https 链接".to_string());
-    }
-    open::that(value).map_err(|error| error.to_string())?;
-    append_log(&state.index, "open_external_url", None, value, "success");
+    let (sanitized, safe_log_target) = sanitized_external_url(&url)?;
+    open::that(sanitized.as_str()).map_err(|error| error.to_string())?;
+    append_log(
+        &state.index,
+        "open_external_url",
+        None,
+        &safe_log_target,
+        "success",
+    );
     Ok(())
 }
 
@@ -6083,6 +9696,17 @@ fn show_pet_dialogue_window(app: &tauri::AppHandle) -> Result<(), String> {
     dialogue.set_focus().map_err(|error| error.to_string())
 }
 
+fn shutdown_social_sessions(app: &tauri::AppHandle) {
+    #[cfg(windows)]
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut sessions) = state.social_sessions.lock() {
+            sessions.clear();
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
 fn handle_native_menu_event(app: &tauri::AppHandle, id: &str) {
     match id {
         TRAY_SHOW_ID | PET_MENU_OPEN_ID => {
@@ -6094,7 +9718,10 @@ fn handle_native_menu_event(app: &tauri::AppHandle, id: &str) {
         TRAY_RESTORE_PET_ID => {
             let _ = restore_pet_to_primary_work_area(app);
         }
-        TRAY_QUIT_ID => app.exit(0),
+        TRAY_QUIT_ID => {
+            shutdown_social_sessions(app);
+            app.exit(0);
+        }
         PET_MENU_DIALOGUE_ID => {
             let _ = app.emit("ui://open-dialogue", ());
         }
@@ -6143,6 +9770,7 @@ fn show_main_from_tray(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    shutdown_social_sessions(&app);
     app.exit(0);
     Ok(())
 }
@@ -6165,32 +9793,86 @@ fn show_pet_context_menu(app: tauri::AppHandle) -> Result<(), String> {
     let pet = app
         .get_webview_window("pet")
         .ok_or_else(|| "宠物窗口不存在".to_string())?;
-    let open_main = MenuItem::with_id(&app, PET_MENU_OPEN_ID, "打开虫洞派", true, None::<&str>)
-        .map_err(|error| error.to_string())?;
-    let dialogue = MenuItem::with_id(&app, PET_MENU_DIALOGUE_ID, "开始对话", true, None::<&str>)
-        .map_err(|error| error.to_string())?;
-    let settings = MenuItem::with_id(&app, PET_MENU_SETTINGS_ID, "宠物设置", true, None::<&str>)
-        .map_err(|error| error.to_string())?;
+    let english = APP_LOCALE
+        .lock()
+        .map(|locale| locale.eq_ignore_ascii_case("en-US"))
+        .unwrap_or(false);
+    let open_main = MenuItem::with_id(
+        &app,
+        PET_MENU_OPEN_ID,
+        if english {
+            "Open Wormhole Pie"
+        } else {
+            "打开虫洞派"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    let dialogue = MenuItem::with_id(
+        &app,
+        PET_MENU_DIALOGUE_ID,
+        if english {
+            "Start dialogue"
+        } else {
+            "开始对话"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    let settings = MenuItem::with_id(
+        &app,
+        PET_MENU_SETTINGS_ID,
+        if english {
+            "Pet settings"
+        } else {
+            "宠物设置"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
     let normal = MenuItem::with_id(
         &app,
         PET_MENU_LAYER_NORMAL_ID,
-        "普通层级",
+        if english {
+            "Normal layer"
+        } else {
+            "普通层级"
+        },
         true,
         None::<&str>,
     )
     .map_err(|error| error.to_string())?;
-    let top = MenuItem::with_id(&app, PET_MENU_LAYER_TOP_ID, "置顶", true, None::<&str>)
-        .map_err(|error| error.to_string())?;
+    let top = MenuItem::with_id(
+        &app,
+        PET_MENU_LAYER_TOP_ID,
+        if english { "Always on top" } else { "置顶" },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
     let bottom = MenuItem::with_id(
         &app,
         PET_MENU_LAYER_BOTTOM_ID,
-        "桌面底层",
+        if english {
+            "Desktop layer"
+        } else {
+            "桌面底层"
+        },
         true,
         None::<&str>,
     )
     .map_err(|error| error.to_string())?;
-    let hide = MenuItem::with_id(&app, PET_MENU_HIDE_ID, "隐藏宠物", true, None::<&str>)
-        .map_err(|error| error.to_string())?;
+    let hide = MenuItem::with_id(
+        &app,
+        PET_MENU_HIDE_ID,
+        if english { "Hide pet" } else { "隐藏宠物" },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
     let separator_one = PredefinedMenuItem::separator(&app).map_err(|error| error.to_string())?;
     let separator_two = PredefinedMenuItem::separator(&app).map_err(|error| error.to_string())?;
     let menu = Menu::with_items(
@@ -6209,6 +9891,86 @@ fn show_pet_context_menu(app: tauri::AppHandle) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     pet.popup_menu(&menu).map_err(|error| error.to_string())
+}
+
+fn build_tray_menu(app: &tauri::AppHandle, english: bool) -> Result<Menu<tauri::Wry>, String> {
+    let tray_show = MenuItem::with_id(
+        app,
+        TRAY_SHOW_ID,
+        if english {
+            "Show Wormhole Pie"
+        } else {
+            "显示虫洞派"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    let tray_exit_rest = MenuItem::with_id(
+        app,
+        TRAY_EXIT_REST_ID,
+        if english {
+            "End break and show app"
+        } else {
+            "结束休息并显示虫洞派"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    let tray_restore_pet = MenuItem::with_id(
+        app,
+        TRAY_RESTORE_PET_ID,
+        if english {
+            "Find pet (normal layer)"
+        } else {
+            "找回宠物（普通层级）"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    let separator = PredefinedMenuItem::separator(app).map_err(|error| error.to_string())?;
+    let tray_quit = MenuItem::with_id(
+        app,
+        TRAY_QUIT_ID,
+        if english {
+            "Quit Wormhole Pie"
+        } else {
+            "退出虫洞派"
+        },
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    Menu::with_items(
+        app,
+        &[
+            &tray_show,
+            &tray_exit_rest,
+            &tray_restore_pet,
+            &separator,
+            &tray_quit,
+        ],
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_app_locale(app: tauri::AppHandle, locale: String) -> Result<(), String> {
+    let english = locale.eq_ignore_ascii_case("en-US");
+    *APP_LOCALE
+        .lock()
+        .map_err(|_| "语言状态不可用".to_string())? =
+        if english { "en-US" } else { "zh-CN" }.to_string();
+    if let Some(tray) = app.tray_by_id("wormhole-pie-tray") {
+        tray.set_menu(Some(build_tray_menu(&app, english)?))
+            .map_err(|error| error.to_string())?;
+        tray.set_tooltip(Some(if english { "Wormhole Pie" } else { "虫洞派" }))
+            .map_err(|error| error.to_string())?;
+    }
+    app.emit("locale://changed", if english { "en-US" } else { "zh-CN" })
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -6432,6 +10194,11 @@ fn undo_last_feed(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<F
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(windows)]
+    if let Some(exit_code) = maybe_run_elevated_file_plan() {
+        std::process::exit(exit_code);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -6520,6 +10287,10 @@ pub fn run() {
                 last_feed: Mutex::new(Vec::new()),
                 organize_batches: Mutex::new(organize_batches),
                 organize_lock: Arc::new(Mutex::new(())),
+                #[cfg(windows)]
+                public_desktop_confirmations: Mutex::new(BTreeMap::new()),
+                #[cfg(windows)]
+                social_sessions: Mutex::new(BTreeMap::new()),
             });
 
             #[cfg(target_os = "macos")]
@@ -6544,40 +10315,7 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             pet_dialogue.set_skip_taskbar(true)?;
 
-            let tray_show = MenuItem::with_id(
-                app,
-                TRAY_SHOW_ID,
-                "显示虫洞派",
-                true,
-                None::<&str>,
-            )?;
-            let tray_exit_rest = MenuItem::with_id(
-                app,
-                TRAY_EXIT_REST_ID,
-                "结束休息并显示虫洞派",
-                true,
-                None::<&str>,
-            )?;
-            let tray_restore_pet = MenuItem::with_id(
-                app,
-                TRAY_RESTORE_PET_ID,
-                "找回宠物（普通层级）",
-                true,
-                None::<&str>,
-            )?;
-            let tray_separator = PredefinedMenuItem::separator(app)?;
-            let tray_quit =
-                MenuItem::with_id(app, TRAY_QUIT_ID, "退出虫洞派", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(
-                app,
-                &[
-                    &tray_show,
-                    &tray_exit_rest,
-                    &tray_restore_pet,
-                    &tray_separator,
-                    &tray_quit,
-                ],
-            )?;
+            let tray_menu = build_tray_menu(app.handle(), false).map_err(std::io::Error::other)?;
             let mut tray = TrayIconBuilder::with_id("wormhole-pie-tray")
                 .menu(&tray_menu)
                 .tooltip("虫洞派")
@@ -6592,6 +10330,7 @@ pub fn run() {
             list_files,
             scan_desktop,
             get_organize_state,
+            request_public_desktop_confirmation,
             organize_desktop,
             review_desktop_organize,
             list_organize_exclusions,
@@ -6619,6 +10358,12 @@ pub fn run() {
             set_desktop_icons_hidden,
             recognize_speech_local,
             open_social,
+            open_social_session,
+            disconnect_social_session,
+            clear_social_session,
+            list_social_accounts,
+            save_social_snapshot,
+            sync_social_snapshot,
             open_external_url,
             start_watching,
             window_action,
@@ -6628,6 +10373,7 @@ pub fn run() {
             show_pet_dialogue,
             hide_pet_dialogue,
             show_pet_context_menu,
+            set_app_locale,
             cursor_position,
             pet_visibility,
             pet_layer,
@@ -6817,6 +10563,262 @@ mod tests {
     }
 
     #[test]
+    fn public_desktop_organization_requires_explicit_opt_in() {
+        assert!(!include_public_desktop_requested(None));
+        assert!(!include_public_desktop_requested(Some(false)));
+        assert!(include_public_desktop_requested(Some(true)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn elevated_plan_digest_and_expiry_are_checked_before_any_move() {
+        let workspace = TempWorkspace::new("elevated-plan-digest");
+        let helper_root = std::env::temp_dir().join("wormhole-pie-elevated-plans");
+        fs::create_dir_all(&helper_root).unwrap();
+        let plan_path = helper_root.join(format!(
+            "test-plan-{}-{}.json",
+            std::process::id(),
+            now_millis()
+        ));
+        let transfer = ElevatedFileTransfer {
+            source: workspace.0.join("source.txt"),
+            destination: workspace.0.join("destination.txt"),
+            is_dir: false,
+            source_digest: "00".repeat(32),
+            source_volume_serial: 0,
+            source_file_index: 0,
+            source_size: 0,
+            source_last_write_time: 0,
+        };
+        let plan = ElevatedFilePlan {
+            version: ELEVATED_FILE_PLAN_VERSION,
+            created_at_millis: now_millis(),
+            library_root: workspace.0.clone(),
+            transfers: vec![transfer.clone()],
+        };
+        let serialized = serde_json::to_vec(&plan).unwrap();
+        fs::write(&plan_path, &serialized).unwrap();
+        let wrong_digest = "0".repeat(64);
+        assert!(execute_elevated_file_plan(&plan_path, &wrong_digest)
+            .unwrap_err()
+            .contains("摘要不匹配"));
+
+        let original_digest = elevated_plan_digest(&serialized);
+        let mut tampered = serialized.clone();
+        tampered.push(b' ');
+        fs::write(&plan_path, tampered).unwrap();
+        assert!(execute_elevated_file_plan(&plan_path, &original_digest)
+            .unwrap_err()
+            .contains("摘要不匹配"));
+
+        let expired = ElevatedFilePlan {
+            version: ELEVATED_FILE_PLAN_VERSION,
+            created_at_millis: now_millis().saturating_sub(6 * 60 * 1_000),
+            library_root: workspace.0.clone(),
+            transfers: vec![transfer],
+        };
+        let serialized = serde_json::to_vec(&expired).unwrap();
+        fs::write(&plan_path, &serialized).unwrap();
+        assert!(
+            execute_elevated_file_plan(&plan_path, &elevated_plan_digest(&serialized))
+                .unwrap_err()
+                .contains("版本无效")
+        );
+        let _ = fs::remove_file(plan_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cross_volume_copy_helper_preserves_file_and_directory_digests() {
+        let workspace = TempWorkspace::new("cross-volume-copy");
+        let source_file = workspace.0.join("source.txt");
+        let destination_file = workspace.0.join("copied.txt");
+        fs::write(&source_file, b"wormhole-pie-cross-volume").unwrap();
+        copy_elevated_path(&source_file, &destination_file).unwrap();
+        assert_eq!(
+            elevated_path_digest(&source_file).unwrap(),
+            elevated_path_digest(&destination_file).unwrap()
+        );
+
+        let source_directory = workspace.0.join("source-directory");
+        let nested = source_directory.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(source_directory.join("one.txt"), b"one").unwrap();
+        fs::write(nested.join("two.bin"), [0u8, 1, 2, 3, 4]).unwrap();
+        let destination_directory = workspace.0.join("copied-directory");
+        copy_elevated_path(&source_directory, &destination_directory).unwrap();
+        assert_eq!(
+            elevated_path_digest(&source_directory).unwrap(),
+            elevated_path_digest(&destination_directory).unwrap()
+        );
+    }
+
+    #[test]
+    fn elevated_file_moves_only_allow_public_desktop_library_pairs() {
+        let workspace = TempWorkspace::new("elevated-boundaries");
+        let public_desktop = workspace.0.join("Public").join("Desktop");
+        let library = workspace.0.join("Documents").join(LIBRARY_ROOT_NAME);
+        let category = library.join("文档");
+        let user_desktop = workspace.0.join("User").join("Desktop");
+        let outside = workspace.0.join("Outside");
+
+        assert!(elevated_parent_pair_allowed(
+            &public_desktop,
+            &category,
+            &public_desktop,
+            &library
+        ));
+        assert!(elevated_parent_pair_allowed(
+            &category,
+            &public_desktop,
+            &public_desktop,
+            &library
+        ));
+        assert!(!elevated_parent_pair_allowed(
+            &user_desktop,
+            &category,
+            &public_desktop,
+            &library
+        ));
+        assert!(!elevated_parent_pair_allowed(
+            &public_desktop,
+            &outside,
+            &public_desktop,
+            &library
+        ));
+        assert!(!elevated_parent_pair_allowed(
+            &public_desktop,
+            &library,
+            &public_desktop,
+            &library
+        ));
+        assert!(!elevated_parent_pair_allowed(
+            &public_desktop,
+            &category.join("nested"),
+            &public_desktop,
+            &library
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn social_page_matching_rejects_lookalike_and_non_web_hosts() {
+        assert!(social_host_matches(
+            "xiaohongshu",
+            "https://www.xiaohongshu.com/user/profile"
+        ));
+        assert!(social_host_matches("x", "https://x.com/notifications"));
+        assert!(social_host_matches(
+            "douyin",
+            "https://creator.douyin.com/creator-micro/home"
+        ));
+        assert!(!social_host_matches(
+            "x",
+            "https://x.com.attacker.example/messages"
+        ));
+        assert!(!social_host_matches(
+            "douyin",
+            "file:///C:/Users/Public/Desktop/test.html"
+        ));
+        assert!(!social_host_matches("unknown", "https://x.com/home"));
+    }
+
+    #[test]
+    fn saved_social_metrics_keep_unavailable_and_verified_source_semantics() {
+        assert_eq!(
+            normalize_saved_social_metric(42, SOCIAL_METRIC_UNAVAILABLE, 99, SOCIAL_METRIC_MANUAL),
+            (0, SOCIAL_METRIC_UNAVAILABLE.to_string())
+        );
+        assert_eq!(
+            normalize_saved_social_metric(
+                1_250,
+                SOCIAL_METRIC_VISIBLE_PAGE,
+                1_250,
+                SOCIAL_METRIC_VISIBLE_PAGE,
+            ),
+            (1_250, SOCIAL_METRIC_VISIBLE_PAGE.to_string())
+        );
+        assert_eq!(
+            normalize_saved_social_metric(
+                1_251,
+                SOCIAL_METRIC_VISIBLE_PAGE,
+                1_250,
+                SOCIAL_METRIC_VISIBLE_PAGE,
+            ),
+            (1_251, SOCIAL_METRIC_MANUAL.to_string())
+        );
+        assert_eq!(
+            normalize_saved_social_metric(0, SOCIAL_METRIC_MANUAL, 9, SOCIAL_METRIC_VISIBLE_PAGE),
+            (0, SOCIAL_METRIC_MANUAL.to_string())
+        );
+        assert_eq!(
+            normalize_saved_social_metric(7, "unexpected", 0, SOCIAL_METRIC_UNAVAILABLE),
+            (7, SOCIAL_METRIC_MANUAL.to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn social_metrics_script_only_returns_visible_summaries() {
+        for platform in ["xiaohongshu", "x", "douyin"] {
+            let script = visible_social_metrics_expression(platform).unwrap();
+            let normalized = script.to_ascii_lowercase();
+            assert!(!normalized.contains("document.cookie"));
+            assert!(!normalized.contains("cookiestore"));
+            assert!(!normalized.contains("localstorage"));
+            assert!(!normalized.contains("sessionstorage"));
+            assert!(!normalized.contains("indexeddb"));
+            assert!(!normalized.contains("innerhtml"));
+            assert!(!normalized.contains("outerhtml"));
+            assert!(!script.contains("elementText(surface)"));
+            assert!(script.contains("displayName"));
+            assert!(script.contains("accountIdentity"));
+            assert!(script.contains("followers"));
+            assert!(script.contains("unreadMessages"));
+            assert!(script.contains("unreadNotifications"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn social_target_selection_never_guesses_between_multiple_pages() {
+        let page = |target_id: &str, url: &str| CdpTargetInfo {
+            target_id: target_id.to_string(),
+            target_type: "page".to_string(),
+            url: url.to_string(),
+        };
+        let one = vec![
+            page("x-main", "https://x.com/home"),
+            page("unrelated", "https://example.com/"),
+        ];
+        assert_eq!(
+            select_unique_social_target("x", &one).unwrap().target_id,
+            "x-main"
+        );
+
+        let ambiguous = vec![
+            page("x-main", "https://x.com/home"),
+            page("x-notifications", "https://x.com/notifications"),
+        ];
+        assert!(select_unique_social_target("x", &ambiguous).is_err());
+    }
+
+    #[test]
+    fn external_urls_require_https_and_remove_secrets_from_open_and_log_values() {
+        assert!(sanitized_external_url("http://example.com/").is_err());
+        assert!(sanitized_external_url("https://user:password@example.com/").is_err());
+
+        let (url, log_target) = sanitized_external_url(
+            "https://example.com/path?q=public&access_token=secret&state=private#fragment",
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://example.com/path?q=public");
+        assert_eq!(log_target, "https://example.com/path");
+        assert!(!url.as_str().contains("secret"));
+        assert!(!url.as_str().contains("private"));
+    }
+
+    #[test]
     fn legacy_migration_can_restore_original_category_structure() {
         let workspace = TempWorkspace::new("legacy");
         let index = test_index(&workspace);
@@ -6870,6 +10872,7 @@ mod tests {
                         organized: library.join("文档").join(format!("file-{number}.txt")),
                         category: "文档".to_string(),
                         is_dir: false,
+                        public_identity: None,
                     }],
                     created_directories: Vec::new(),
                 })
@@ -7033,6 +11036,7 @@ mod tests {
             organized: PathBuf::from(r"C:\Users\owner\Documents\虫洞派资料库\快捷方式\Tool.lnk"),
             category: "快捷方式".to_string(),
             is_dir: false,
+            public_identity: None,
         };
         let actual = PathBuf::from(r"C:\Users\owner\Desktop\Tool (2).lnk");
         let item = restored_organize_item(&move_record, &actual);
@@ -7251,7 +11255,7 @@ mod tests {
             AgentConnectorKind::Claude,
             AgentConnectorKind::Hermes,
         ] {
-            let arguments = agent_task_arguments(kind, task);
+            let arguments = agent_task_arguments(kind, task, None);
             assert_eq!(arguments.last(), Some(&OsString::from(task)));
             assert_eq!(
                 arguments
@@ -7274,9 +11278,9 @@ mod tests {
             }));
         }
 
-        let codex = agent_task_arguments(AgentConnectorKind::Codex, task);
+        let codex = agent_task_arguments(AgentConnectorKind::Codex, task, None);
         assert!(codex.iter().any(|argument| argument == "workspace-write"));
-        let hermes = agent_task_arguments(AgentConnectorKind::Hermes, task);
+        let hermes = agent_task_arguments(AgentConnectorKind::Hermes, task, None);
         assert!(hermes.iter().any(|argument| argument == "--checkpoints"));
     }
 
@@ -7423,17 +11427,54 @@ mod tests {
             duration_ms: 10,
             truncated: false,
         };
-        let public = agent_task_public_output(&failed);
-        assert!(!public.contains("workflow"));
-        assert!(!public.contains("settings.json"));
-        assert!(!public.contains("secret"));
+        let public = agent_task_public_output(AgentConnectorKind::Claude, &failed);
+        assert!(!public.0.contains("workflow"));
+        assert!(!public.0.contains("settings.json"));
+        assert!(!public.0.contains("secret"));
 
         let succeeded = BoundedProcessOutput {
             success: true,
             stdout: "最终结果".to_string(),
             ..failed
         };
-        assert_eq!(agent_task_public_output(&succeeded), "最终结果");
+        assert_eq!(
+            agent_task_public_output(AgentConnectorKind::Claude, &succeeded),
+            ("最终结果".to_string(), None)
+        );
+
+        let succeeded_json = BoundedProcessOutput {
+            stdout: r#"{"result":"最终结果","session_id":"12345678-1234-4abc-a123-123456789abc"}"#
+                .to_string(),
+            ..succeeded
+        };
+        assert_eq!(
+            agent_task_public_output(AgentConnectorKind::Claude, &succeeded_json),
+            (
+                "最终结果".to_string(),
+                Some("12345678-1234-4abc-a123-123456789abc".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn failed_agent_output_exposes_only_safe_actionable_categories() {
+        let failed = BoundedProcessOutput {
+            success: false,
+            timed_out: false,
+            cancelled: false,
+            stdout: String::new(),
+            stderr: "There's an issue with the selected model (private-model). It may not exist or you may not have access to it. token=secret".to_string(),
+            exit_code: Some(1),
+            duration_ms: 10,
+            truncated: false,
+        };
+        let public = agent_task_public_output(AgentConnectorKind::Claude, &failed);
+        assert_eq!(
+            public.0,
+            "Claude Code 当前模型不可用或账号无权访问，请在 Agent 管理中检查模型配置。"
+        );
+        assert!(!public.0.contains("private-model"));
+        assert!(!public.0.contains("secret"));
     }
 
     #[test]

@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 2,
+  "pipelineVersion": "2.0.0",
+  "generatedAtUtc": "2026-07-18T06:40:13.082153+00:00",
+  "generator": {
+    "script": "tools/blender/generate_pet_models.py",
+    "scriptSha256": "c80a6ceb1743342bbfe0f70d7b518d7cf2b710025e614b657f16b87b089b5798",
+    "command": "& 'C:\\Program Files\\Blender Foundation\\Blender 5.1\\blender.exe' --background --factory-startup --python tools\\blender\\generate_pet_models.py"
+  },
+  "blender": {
+    "version": "5.1.2",
+    "buildHash": "ec6e62d40fa9"
+  },
+  "render": {
+    "engine": "BLENDER_EEVEE",
+    "width": 256,
+    "height": 256,
+    "format": "PNG",
+    "colorMode": "RGBA",
+    "transparent": true,
+    "frameCount": 4,
+    "pathPattern": "{species}/{stage}/{route}/{motionFamily}/{frame}.png",
+    "legacyCompatibilityPattern": "{species}/{stage}/{frame}.png",
+    "primaryAssetCount": 1260,
+    "compatibilityAssetCount": 60,
+    "totalAssetCount": 1320
+  },
+  "source": {
+    "blend": "assets/blender/wormhole-pets.blend",
+    "modelCount": 15,
+    "armaturePerModel": true,
+    "bones": [
+      "root",
+      "spine",
+      "head",
+      "arm.L",
+      "arm.R",
+      "leg.L",
+      "leg.R",
+      "ear.L",
+      "ear.R",
+      "tail",
+      "accessory",
+      "prop"
+    ],
+    "timelineRanges": {
+      "idle": [
+        1,
+        4
+      ],
+      "move": [
+        11,
+        14
+      ],
+      "joy": [
+        21,
+        24
+      ],
+      "rest": [
+        31,
+        34
+      ],
+      "focus": [
+        41,
+        44
+      ],
+      "file": [
+        51,
+        54
+      ],
+      "alert": [
+        61,
+        64
+      ]
+    }
+  },
+  "species": [
+    "corgi",
+    "star-cat",
+    "moon-rabbit",
+    "river-otter",
+    "bear-cub"
+  ],
+  "speciesAliases": {
+    "cloud-fox": "corgi"
+  },
+  "stages": [
+    "seedling",
+    "growing",
+    "evolved"
+  ],
+  "routes": {
+    "companion": {
+      "accessory": "heart",
+      "accentRgba": [
+        0.94,
+        0.27,
+        0.48,
+        1
+      ]
+    },
+    "creator": {
+      "accessory": "orbit",
+      "accentRgba": [
+        1.0,
+        0.63,
+        0.1,
+        1
+      ]
+    },
+    "guardian": {
+      "accessory": "shield",
+      "accentRgba": [
+        0.2,
+        0.48,
+        0.86,
+        1
+      ]
+    }
+  },
+  "motionFamilies": [
+    "idle",
+    "move",
+    "joy",
+    "rest",
+    "focus",
+    "file",
+    "alert"
+  ],
+  "actions": {
+    "idle_breathe": "idle",
+    "blink": "idle",
+    "ear_twitch": "idle",
+    "tail_flick": "idle",
+    "yawn": "idle",
+    "idle_lookaround": "idle",
+    "cursor_notice": "idle",
+    "hover_interest": "idle",
+    "walk": "move",
+    "drag": "move",
+    "run": "move",
+    "hop": "move",
+    "edge_balance": "move",
+    "release_bounce": "move",
+    "click_feedback": "joy",
+    "task_success": "joy",
+    "affection": "joy",
+    "double_click_excited": "joy",
+    "pet_loop": "joy",
+    "tickle_laugh": "joy",
+    "high_five": "joy",
+    "emotion_happy": "joy",
+    "emotion_surprised": "joy",
+    "dance": "joy",
+    "snack_eat": "joy",
+    "sleep": "rest",
+    "rest_reminder": "rest",
+    "hide_peek": "rest",
+    "stretch": "rest",
+    "groom": "rest",
+    "listen": "focus",
+    "think": "focus",
+    "typing_watch": "focus",
+    "voice_wake": "focus",
+    "speak_loop": "focus",
+    "file_eat": "file",
+    "file_notice": "file",
+    "file_reject": "file",
+    "trash_success": "file",
+    "task_failure": "alert",
+    "permission_wait": "alert",
+    "emotion_sad": "alert",
+    "emotion_angry": "alert",
+    "trash_fail_cough": "alert"
+  },
+  "actionMapSha256": "f9b5dab24aab2ed343654410c9737b01d487fa8be1b8ec56da4712f286a69dc3",
+  "runtimeContract": {
+    "sourceType": "Blender-authored 3D armature baked to 2D PNG frames",
+    "realTime3d": false,
+    "fallback": "requested route/family -> companion family -> companion idle -> legacy Pai frames"
+  }
+}

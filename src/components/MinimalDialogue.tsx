@@ -1,6 +1,8 @@
 import { ArrowUp, Bot, ChevronDown, ExternalLink, FileText, FileUp, LoaderCircle, Mic, MicOff, Paperclip, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { MAX_DIALOGUE_ATTACHMENTS, normalizeDialogueAttachmentPaths } from "../dialogueSessions";
+import type { DialogueMessage } from "../dialogueSessions";
 import { isTauri, pickDialogueFiles, subscribeToWindowFileDrop } from "../lib/desktop";
 import type { AgentConnectorStatus, AgentResultFile, DialogueConnectorId, DialogueSubmission } from "../lib/desktop";
 
@@ -10,6 +12,9 @@ type Props = {
   petName: string;
   userMessage: string;
   reply: string;
+  messages?: DialogueMessage[];
+  draft: string;
+  attachmentPaths: string[];
   voiceEnabled: boolean;
   isListening: boolean;
   busy?: boolean;
@@ -24,12 +29,14 @@ type Props = {
   onSubmit: (submission: DialogueSubmission) => void | Promise<void>;
   onMic: () => Promise<string | null>;
   onConnector: (connectorId: DialogueConnectorId) => void;
+  onDraftChange: (draft: string) => void;
+  onAttachmentPathsChange: (next: string[] | ((current: string[]) => string[])) => void;
   onOpenResultFile?: (file: AgentResultFile) => void | Promise<void>;
   onStop?: () => void;
 };
 
-const MAX_DIALOGUE_ATTACHMENTS = 8;
 const EMPTY_RESULT_FILES: AgentResultFile[] = [];
+const EMPTY_MESSAGES: DialogueMessage[] = [];
 type DialogueResizeDirection = Parameters<ReturnType<typeof getCurrentWindow>["startResizeDragging"]>[0];
 
 const resizeHandles: ReadonlyArray<readonly [string, DialogueResizeDirection]> = [
@@ -71,6 +78,9 @@ export function MinimalDialogue({
   petName,
   userMessage,
   reply,
+  messages = EMPTY_MESSAGES,
+  draft,
+  attachmentPaths,
   voiceEnabled,
   isListening,
   busy = false,
@@ -85,11 +95,11 @@ export function MinimalDialogue({
   onSubmit,
   onMic,
   onConnector,
+  onDraftChange,
+  onAttachmentPathsChange,
   onOpenResultFile,
   onStop,
 }: Props) {
-  const [draft, setDraft] = useState("");
-  const [attachmentPaths, setAttachmentPaths] = useState<string[]>([]);
   const [attachmentNotice, setAttachmentNotice] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const [pickerBusy, setPickerBusy] = useState(false);
@@ -102,24 +112,17 @@ export function MinimalDialogue({
   connectorIdRef.current = connectorId;
 
   const addAttachments = useCallback((paths: string[]) => {
-    const candidates = paths.map((path) => path.trim()).filter(Boolean);
+    const candidates = normalizeDialogueAttachmentPaths(paths);
     if (!candidates.length) return;
-    setAttachmentPaths((current) => {
-      const keys = new Set(current.map((path) => path.toLocaleLowerCase()));
-      const next = [...current];
-      for (const path of candidates) {
-        const key = path.toLocaleLowerCase();
-        if (keys.has(key)) continue;
-        if (next.length >= MAX_DIALOGUE_ATTACHMENTS) break;
-        keys.add(key);
-        next.push(path);
-      }
-      setAttachmentNotice(next.length >= MAX_DIALOGUE_ATTACHMENTS && candidates.some((path) => !keys.has(path.toLocaleLowerCase()))
+    onAttachmentPathsChange((current) => {
+      const next = normalizeDialogueAttachmentPaths([...current, ...candidates]);
+      const accepted = new Set(next.map((path) => path.toLocaleLowerCase()));
+      setAttachmentNotice(candidates.some((path) => !accepted.has(path.toLocaleLowerCase()))
         ? `一次最多带 ${MAX_DIALOGUE_ATTACHMENTS} 个文件。`
         : "");
       return next;
     });
-  }, []);
+  }, [onAttachmentPathsChange]);
 
   useEffect(() => {
     if (open) window.setTimeout(() => inputRef.current?.focus(), 170);
@@ -132,14 +135,18 @@ export function MinimalDialogue({
       if (messages) messages.scrollTop = messages.scrollHeight;
     });
     return () => window.cancelAnimationFrame(frame);
-  }, [busy, open, reply, resultFiles.length, userMessage]);
+  }, [busy, messages, open, reply, resultFiles.length, userMessage]);
 
   useEffect(() => {
     if (open) return;
-    setAttachmentPaths([]);
     setAttachmentNotice("");
     setDropActive(false);
   }, [open]);
+
+  useEffect(() => {
+    setAttachmentNotice("");
+    setDropActive(false);
+  }, [connectorId]);
 
   useEffect(() => {
     if (!open) return;
@@ -184,8 +191,8 @@ export function MinimalDialogue({
     setSubmitting(true);
     try {
       await onSubmit({ text, attachmentPaths: [...attachmentPaths] });
-      setDraft("");
-      setAttachmentPaths([]);
+      onDraftChange("");
+      onAttachmentPathsChange([]);
       setAttachmentNotice("");
     } catch (error) {
       console.error(error);
@@ -230,6 +237,19 @@ export function MinimalDialogue({
     void getCurrentWindow().startResizeDragging(direction).catch(console.error);
   };
 
+  const historyMessages: DialogueMessage[] = messages.length ? messages : [
+    ...(userMessage ? [{ id: "legacy-user", role: "user" as const, text: userMessage, createdAt: 0, resultFiles: [] }] : []),
+    ...((reply || !userMessage) ? [{ id: "legacy-assistant", role: "assistant" as const, text: reply || "想让我做什么？", createdAt: 0, resultFiles }] : []),
+  ];
+  const lastHistoryMessage = historyMessages.at(-1);
+  const showPreviewReply = !busy
+    && Boolean(reply)
+    && lastHistoryMessage?.role !== "user"
+    && (lastHistoryMessage?.text !== reply || JSON.stringify(lastHistoryMessage.resultFiles) !== JSON.stringify(resultFiles));
+  const visibleMessages = showPreviewReply
+    ? [...historyMessages, { id: "preview-assistant", role: "assistant" as const, text: reply, createdAt: Date.now(), resultFiles }]
+    : historyMessages;
+
   return (
     <div className={standalone ? "dialogue-window-surface" : "dialogue-scrim"} onMouseDown={standalone ? undefined : onClose}>
       <section className={`minimal-dialogue ${standalone ? "is-standalone" : ""} ${dropActive ? "is-drop-active" : ""}`} onMouseDown={(event) => event.stopPropagation()} aria-label={`与${petName}对话`}>
@@ -249,10 +269,10 @@ export function MinimalDialogue({
         <header className="minimal-dialogue-heading" data-tauri-drag-region={standalone ? "" : undefined}>
           <span className="dialogue-face" aria-hidden="true"><i /><i /></span>
           <div className="dialogue-identity">
-            <strong>{petName}</strong>
+            <strong data-no-i18n>{petName}</strong>
             <label className="dialogue-connector" title="选择执行方式">
               <Bot size={11} />
-              <select value={connectorId} disabled={busy} onChange={(event) => onConnector(event.target.value as DialogueConnectorId)} aria-label="选择本机 Agent">
+              <select value={connectorId} onChange={(event) => onConnector(event.target.value as DialogueConnectorId)} aria-label="选择本机 Agent">
                 <option value="local">本地助手</option>
                 {connectors.map((connector) => (
                   <option key={connector.id} value={connector.id} disabled={!connectorReady(connector)}>
@@ -267,7 +287,24 @@ export function MinimalDialogue({
         </header>
 
         <div className="minimal-dialogue-messages" ref={messagesRef} aria-live="polite" aria-busy={busy}>
-          {userMessage ? <p className="dialogue-user-message">{userMessage}</p> : null}
+          {visibleMessages.map((message) => message.role === "user" ? (
+            <p key={message.id} className="dialogue-user-message" data-no-i18n>{message.text}</p>
+          ) : (
+            <div className="dialogue-pet-response" key={message.id}>
+              <p className="dialogue-pet-message" data-no-i18n={connectorId === "local" ? undefined : true}>{message.text}</p>
+              {message.resultFiles.length ? (
+                <div className="dialogue-result-files" aria-label={`Agent 交付了 ${message.resultFiles.length} 个文件`}>
+                  {message.resultFiles.map((file) => (
+                    <button key={file.path} type="button" onClick={() => void onOpenResultFile?.(file)} title={`打开 ${file.relativePath}`}>
+                      <span><FileText size={13} /></span>
+                      <span data-no-i18n><strong>{file.name}</strong><small>{file.relativePath}</small></span>
+                      <ExternalLink size={11} />
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ))}
           {busy ? (
             <p className="dialogue-pet-message is-busy">
               <span className="dialogue-agent-motion" aria-hidden="true"><i /><i /><i /></span>
@@ -287,22 +324,7 @@ export function MinimalDialogue({
                 <button type="button" className="dialogue-stop-agent" onClick={onStop} aria-label="停止当前 Agent 任务"><Square size={9} />停止</button>
               ) : null}
             </p>
-          ) : (
-            <div className="dialogue-pet-response">
-              <p className="dialogue-pet-message">{reply || "想让我做什么？"}</p>
-              {resultFiles.length ? (
-                <div className="dialogue-result-files" aria-label={`Agent 交付了 ${resultFiles.length} 个文件`}>
-                  {resultFiles.map((file) => (
-                    <button key={file.path} type="button" onClick={() => void onOpenResultFile?.(file)} title={`打开 ${file.relativePath}`}>
-                      <span><FileText size={13} /></span>
-                      <span><strong>{file.name}</strong><small>{file.relativePath}</small></span>
-                      <ExternalLink size={11} />
-                    </button>
-                  ))}
-                </div>
-              ) : null}
-            </div>
-          )}
+          ) : null}
         </div>
 
         <form className="minimal-dialogue-composer" onSubmit={submit}>
@@ -311,8 +333,8 @@ export function MinimalDialogue({
               {attachmentPaths.map((path) => (
                 <span className="dialogue-attachment-chip" key={path}>
                   <Paperclip size={10} aria-hidden="true" />
-                  <span>{attachmentName(path)}</span>
-                  <button type="button" disabled={busy} onClick={() => setAttachmentPaths((current) => current.filter((item) => item !== path))} aria-label={`移除 ${attachmentName(path)}`}>
+                  <span data-no-i18n>{attachmentName(path)}</span>
+                  <button type="button" disabled={busy} onClick={() => onAttachmentPathsChange((current) => current.filter((item) => item !== path))} aria-label={`移除 ${attachmentName(path)}`}>
                     <X size={9} />
                   </button>
                 </span>
@@ -331,7 +353,7 @@ export function MinimalDialogue({
             >
               {pickerBusy ? <LoaderCircle size={15} className="is-spinning" /> : <FileUp size={15} />}
             </button>
-            <input ref={inputRef} disabled={busy} value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={busy ? "Agent 工作中…" : attachmentPaths.length ? "补充一句，或直接发送…" : "说一句…"} aria-label="输入消息" />
+            <input ref={inputRef} disabled={busy} value={draft} onChange={(event) => onDraftChange(event.target.value)} placeholder={busy ? "Agent 工作中…" : attachmentPaths.length ? "补充一句，或直接发送…" : "说一句…"} aria-label="输入消息" />
             <button
               type="button"
               className={`${isListening ? "is-listening" : ""} ${voiceEnabled ? "" : "is-unavailable"}`}
@@ -349,7 +371,7 @@ export function MinimalDialogue({
           <div className="dialogue-drop-overlay" aria-hidden="true">
             <span><Paperclip size={20} /></span>
             <strong>松开，把文件交给 Agent</strong>
-            <small>最多 {MAX_DIALOGUE_ATTACHMENTS} 个文件</small>
+            <small>{`最多 ${MAX_DIALOGUE_ATTACHMENTS} 个文件`}</small>
           </div>
         ) : null}
       </section>
