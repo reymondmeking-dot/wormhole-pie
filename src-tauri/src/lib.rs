@@ -1,7 +1,6 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -757,7 +756,7 @@ fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
     false
 }
 
-fn is_hidden_or_system(name: &OsStr, metadata: &fs::Metadata) -> bool {
+fn is_hidden_or_system(name: &OsStr, _metadata: &fs::Metadata) -> bool {
     if name.to_string_lossy().starts_with('.') {
         return true;
     }
@@ -766,7 +765,7 @@ fn is_hidden_or_system(name: &OsStr, metadata: &fs::Metadata) -> bool {
     {
         const FILE_ATTRIBUTE_HIDDEN: u32 = 0x0002;
         const FILE_ATTRIBUTE_SYSTEM: u32 = 0x0004;
-        let attributes = metadata.file_attributes();
+        let attributes = _metadata.file_attributes();
         attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
     }
 
@@ -2027,7 +2026,7 @@ fn execute_permission_denied_transfers(
 fn move_regular_transfer(
     source: &Path,
     destination: &Path,
-    is_dir: bool,
+    _is_dir: bool,
 ) -> Result<(), FileTransferError> {
     match fs::rename(source, destination) {
         Ok(()) => Ok(()),
@@ -2037,7 +2036,7 @@ fn move_regular_transfer(
                 let transfer = elevated_transfer_from_paths(
                     source.to_path_buf(),
                     destination.to_path_buf(),
-                    is_dir,
+                    _is_dir,
                 )
                 .map_err(|message| FileTransferError {
                     message,
@@ -4710,14 +4709,14 @@ fn find_edge_executable() -> Option<PathBuf> {
 
 #[tauri::command]
 fn open_social_session(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     platform: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_social_platform(&platform)?;
     #[cfg(windows)]
     {
-        if open_managed_social_route(&app, &platform, SocialRoute::Home, &state)? {
+        if open_managed_social_route(&_app, &platform, SocialRoute::Home, &state)? {
             update_social_connection(&state.index, &platform, false)?;
         }
     }
@@ -5429,7 +5428,7 @@ fn organize_desktop(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     include_public_desktop: Option<bool>,
-    confirmation_token: Option<String>,
+    _confirmation_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<DesktopOrganizeResult, String> {
     let _operation_guard = state
@@ -5463,7 +5462,10 @@ fn organize_desktop(
     } else {
         collect_organize_plan(&desktop, &exclusion_keys)?
     };
+    #[cfg(windows)]
     let mut expected_public_identities = None;
+    #[cfg(not(windows))]
+    let expected_public_identities: Option<BTreeMap<String, DesktopOrganizeIdentity>> = None;
     if organize_public_desktop {
         append_public_desktop_plan(&desktop, &exclusion_keys, &mut plan);
         #[cfg(windows)]
@@ -5471,7 +5473,7 @@ fn organize_desktop(
             let (snapshot_digest, identities) = public_organize_plan_snapshot(&plan)?;
             consume_public_desktop_confirmation(
                 &state.public_desktop_confirmations,
-                confirmation_token.as_deref(),
+                _confirmation_token.as_deref(),
                 PUBLIC_DESKTOP_ACTION_ORGANIZE,
                 None,
                 Vec::new(),
@@ -5770,7 +5772,7 @@ fn review_desktop_organize(
     excluded_move_ids: Vec<String>,
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
-    confirmation_token: Option<String>,
+    _confirmation_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<DesktopOrganizeReviewResult, String> {
     let _operation_guard = state
@@ -5829,7 +5831,7 @@ fn review_desktop_organize(
         #[cfg(windows)]
         consume_public_desktop_confirmation(
             &state.public_desktop_confirmations,
-            confirmation_token.as_deref(),
+            _confirmation_token.as_deref(),
             PUBLIC_DESKTOP_ACTION_REVIEW,
             Some(&batch.batch_id),
             requested_ids.iter().cloned().collect(),
@@ -6152,7 +6154,7 @@ fn remove_organize_exclusion(name_key: String, state: State<'_, AppState>) -> Re
 fn undo_desktop_organize(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
-    confirmation_token: Option<String>,
+    _confirmation_token: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<DesktopOrganizeResult, String> {
     let _operation_guard = state
@@ -6175,7 +6177,7 @@ fn undo_desktop_organize(
         #[cfg(windows)]
         consume_public_desktop_confirmation(
             &state.public_desktop_confirmations,
-            confirmation_token.as_deref(),
+            _confirmation_token.as_deref(),
             PUBLIC_DESKTOP_ACTION_UNDO,
             Some(&batch.batch_id),
             Vec::new(),
@@ -9242,14 +9244,14 @@ fn open_agent_result_file(path: String, workspace: String) -> Result<(), String>
 
 #[tauri::command]
 fn open_social(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     platform: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     validate_social_platform(&platform)?;
     #[cfg(windows)]
     {
-        if open_managed_social_route(&app, &platform, SocialRoute::Publish, &state)? {
+        if open_managed_social_route(&_app, &platform, SocialRoute::Publish, &state)? {
             update_social_connection(&state.index, &platform, false)?;
         }
     }
@@ -10303,12 +10305,14 @@ pub fn run() {
             main.set_skip_taskbar(true)?;
             position_main_top_right(&main).map_err(std::io::Error::other)?;
 
+            #[allow(unused_variables)]
             let pet = app
                 .get_webview_window("pet")
                 .ok_or_else(|| std::io::Error::other("宠物窗口不存在"))?;
             #[cfg(not(target_os = "macos"))]
             pet.set_skip_taskbar(true)?;
 
+            #[allow(unused_variables)]
             let pet_dialogue = app
                 .get_webview_window("pet-dialogue")
                 .ok_or_else(|| std::io::Error::other("宠物对话窗口不存在"))?;
