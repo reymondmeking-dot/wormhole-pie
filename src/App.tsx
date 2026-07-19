@@ -63,6 +63,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { MinimalDialogue } from "./components/MinimalDialogue";
 import { AgentManagerPanel } from "./components/AgentManagerPanel";
 import { HomeSectionFrame, HomeSectionRail } from "./components/HomeSectionRail";
@@ -4796,9 +4797,11 @@ function App() {
     document.title = title;
     if (!isTauri()) return;
     let cancelled = false;
-    void import("@tauri-apps/api/window")
-      .then(({ getCurrentWindow }) => cancelled ? undefined : getCurrentWindow().setTitle(title))
-      .catch(console.error);
+    void getCurrentWindow()
+      .setTitle(title)
+      .catch((error) => {
+        if (!cancelled) console.error(error);
+      });
     return () => { cancelled = true; };
   }, [locale, windowKind]);
 

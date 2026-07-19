@@ -1,5 +1,13 @@
 # 更新日志 / Changelog
 
+## [Unreleased]
+
+### 改进
+
+- 新增 Windows、macOS 与前端三路持续质量门禁，在合并前执行类型检查、生产构建、Rust 格式、Clippy 和测试。
+- 发布流水线升级到 Node 24 兼容的 GitHub Actions，并在打包前执行平台原生 Rust 检查。
+- 合并重复的 Tauri API 加载路径，消除 Vite 动静态导入告警并缩小主 JavaScript 包体。
+
 ## [0.2.0] - 2026-07-19
 
 ### 新增

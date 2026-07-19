@@ -1,7 +1,9 @@
 import type { DesktopFile, FileKind, OrganizedCategory, OrganizeExclusion, ProgramEntry } from "../types";
 import type { PetMarkerEvent, PetRuntimeSnapshot, PetSignalEvent } from "../pet/petBehaviorTypes";
 import { mockFiles } from "../data/mockData";
+import { invoke } from "@tauri-apps/api/core";
 import { LogicalPosition } from "@tauri-apps/api/dpi";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 type TauriWindow = Window & { __TAURI_INTERNALS__?: unknown };
@@ -137,7 +139,6 @@ function isStartupStateRace(error: unknown) {
 }
 
 async function invokeWhenStateReady<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import("@tauri-apps/api/core");
   const deadline = Date.now() + STARTUP_STATE_RETRY_TIMEOUT_MS;
   while (true) {
     try {
@@ -237,7 +238,6 @@ export async function requestPublicDesktopConfirmation(
   moveIds: string[] = [],
 ): Promise<string> {
   if (!isTauri()) return `browser-public-confirmation-${action}-${Date.now()}`;
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string>("request_public_desktop_confirmation", { action, batchId, moveIds });
 }
 
@@ -309,7 +309,6 @@ export async function organizeDesktop(includePublicDesktop = false, confirmation
       items,
     };
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<DesktopOrganizeResult>("organize_desktop", { includePublicDesktop, confirmationToken });
 }
 
@@ -352,7 +351,6 @@ export async function reviewDesktopOrganize(batchId: string, excludedMoveIds: st
       }).filter(Boolean),
     };
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<DesktopOrganizeReviewResult>("review_desktop_organize", { batchId, excludedMoveIds, confirmationToken });
 }
 
@@ -376,7 +374,6 @@ export async function undoDesktopOrganize(confirmationToken?: string): Promise<D
       items: batch.items,
     };
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<DesktopOrganizeResult>("undo_desktop_organize", { confirmationToken });
 }
 
@@ -397,19 +394,16 @@ export async function setDesktopIconsHidden(hidden: boolean): Promise<DesktopIco
     browserDesktopIconsHidden = hidden;
     return { supported: true, hidden, publicDesktopCount: 2 };
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<DesktopIconState>("set_desktop_icons_hidden", { hidden });
 }
 
 export async function openDesktopFile(fileId: DesktopFile["id"]): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("open_file", { fileId });
 }
 
 export async function updateDesktopFileCategory(fileId: DesktopFile["id"], category: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("update_file_category", { fileId, category });
 }
 
@@ -423,7 +417,6 @@ export async function openSocialPage(platform: "xiaohongshu" | "x" | "douyin"): 
     window.open(urls[platform], "_blank", "noopener,noreferrer");
     return;
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("open_social", { platform });
 }
 
@@ -452,37 +445,31 @@ export async function openSocialSession(platform: SocialPlatform): Promise<void>
     window.open(urls[platform], "_blank", "noopener,noreferrer");
     return;
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("open_social_session", { platform });
 }
 
 export async function listSocialAccounts(): Promise<SocialAccountSnapshot[]> {
   if (!isTauri()) return [];
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<SocialAccountSnapshot[]>("list_social_accounts");
 }
 
 export async function saveSocialSnapshot(snapshot: SocialAccountSnapshot): Promise<SocialAccountSnapshot> {
   if (!isTauri()) return { ...snapshot, updatedAt: Math.floor(Date.now() / 1000) };
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<SocialAccountSnapshot>("save_social_snapshot", { snapshot });
 }
 
 export async function syncSocialSnapshot(platform: SocialPlatform): Promise<SocialAccountSnapshot> {
   if (!isTauri()) throw new Error("浏览器预览无法读取托管登录会话");
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<SocialAccountSnapshot>("sync_social_snapshot", { platform });
 }
 
 export async function disconnectSocialSession(platform: SocialPlatform): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("disconnect_social_session", { platform });
 }
 
 export async function clearSocialSession(platform: SocialPlatform): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("clear_social_session", { platform });
 }
 
@@ -516,7 +503,6 @@ export async function openExternalUrl(url: string): Promise<void> {
     window.open(parsed.toString(), "_blank", "noopener,noreferrer");
     return;
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("open_external_url", { url: parsed.toString() });
 }
 
@@ -527,19 +513,16 @@ export async function startDesktopWatcher(): Promise<void> {
 
 export async function subscribeToFileChanges(onChange: () => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen("files://changed", onChange);
 }
 
 export async function windowAction(action: "minimize" | "close") {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("window_action", { action });
 }
 
 export async function hideMainToTray(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("hide_main_to_tray");
 }
 
@@ -550,37 +533,31 @@ export async function listPrograms(): Promise<ProgramEntry[]> {
 
 export async function quitApp(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("quit_app");
 }
 
 export async function launchProgram(path: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("launch_program", { path });
 }
 
 export async function listAgentConnectors(force = false): Promise<AgentConnectorStatus[]> {
   if (!isTauri()) return browserAgentConnectors.map((connector) => ({ ...connector }));
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<AgentConnectorStatus[]>("list_agent_connectors", { force });
 }
 
 export async function getAgentDefaultWorkspace(): Promise<string> {
   if (!isTauri()) return "C:\\Users\\你\\Documents";
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string>("get_agent_default_workspace");
 }
 
 export async function getAgentDefaultInstallDirectory(): Promise<string> {
   if (!isTauri()) return "C:\\Users\\你\\Documents\\虫洞派 Agents";
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string>("get_agent_default_install_directory");
 }
 
 export async function pickDirectory(title: string): Promise<string | null> {
   if (!isTauri()) return title.includes("任务") ? "C:\\Users\\你\\Documents\\Codex" : "C:\\Users\\你\\Documents\\虫洞派 Agents";
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string | null>("pick_directory", { title });
 }
 
@@ -595,25 +572,21 @@ export async function installAgent(request: AgentInstallRequest): Promise<AgentI
       detail: request.locale === "zh-CN" ? "浏览器预览：已模拟使用中国镜像源安装" : "Browser preview: simulated global-source installation",
     };
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<AgentInstallResult>("install_agent", { request });
 }
 
 export async function testAgentApi(config: AgentApiConfig): Promise<AgentApiTestResult> {
   if (!isTauri()) return { reachable: true, detail: "浏览器预览：接口地址可达" };
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<AgentApiTestResult>("test_agent_api", { config });
 }
 
 export async function saveAgentApiConfig(config: AgentApiConfig): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("save_agent_api_config", { config });
 }
 
 export async function showMainFromTray(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("show_main_from_tray");
 }
 
@@ -635,7 +608,6 @@ export async function restoreLibraryItemsToDesktop(paths: string[]): Promise<Lib
     browserDesktopFiles = [...browserDesktopFiles, ...restored];
     return { restoredCount: restored.length, conflictCount: 0, restoredPaths: restored.map((file) => file.path) };
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<LibraryRestoreResult>("restore_library_items_to_desktop", { paths });
 }
 
@@ -648,7 +620,6 @@ export async function runAgentTask(
   providerSessionId?: string | null,
 ): Promise<AgentTaskResult> {
   if (!isTauri()) throw new Error("浏览器预览无法运行本机 Agent 任务，请在虫洞派桌面应用中使用。");
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<AgentTaskResult>("run_agent_task", {
     connectorId,
     task,
@@ -661,49 +632,41 @@ export async function runAgentTask(
 
 export async function pickDialogueFiles(locale = document.documentElement.lang): Promise<string[]> {
   if (!isTauri()) return [];
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<string[]>("pick_dialogue_files", { locale });
 }
 
 export async function openAgentResultFile(path: string, workspace: string): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("open_agent_result_file", { path, workspace });
 }
 
 export async function getAgentTaskStatus(): Promise<AgentTaskStatus | null> {
   if (!isTauri()) return null;
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<AgentTaskStatus | null>("get_agent_task_status");
 }
 
 export async function getAgentTaskResult(taskId?: string): Promise<AgentTaskResult | null> {
   if (!isTauri()) return null;
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<AgentTaskResult | null>("get_agent_task_result", { taskId });
 }
 
 export async function stopAgentTask(taskId?: string): Promise<boolean> {
   if (!isTauri()) return false;
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<boolean>("stop_agent_task", { taskId });
 }
 
 export async function subscribeToAgentTaskStatus(onStatus: (status: AgentTaskStatus) => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<AgentTaskStatus>("agent://task-status", (event) => onStatus(event.payload));
 }
 
 export async function subscribeToAgentTaskResult(onResult: (result: AgentTaskResult) => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<AgentTaskResult>("agent://task-result", (event) => onResult(event.payload));
 }
 
 export async function recognizeLocalSpeech(): Promise<string> {
   if (!isTauri()) throw new Error("浏览器预览无法访问本机麦克风模型，请先使用文字输入。");
-  const { invoke } = await import("@tauri-apps/api/core");
   const result = await invoke<string | { text?: string; transcript?: string }>("recognize_speech_local");
   const transcript = typeof result === "string" ? result : result.text ?? result.transcript ?? "";
   if (!transcript.trim()) throw new Error("没有听清，再说一次吧。");
@@ -720,13 +683,11 @@ export async function removeOrganizeExclusion(nameKey: string): Promise<void> {
     browserExclusions = browserExclusions.filter((item) => item.nameKey !== nameKey);
     return;
   }
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("remove_organize_exclusion", { nameKey });
 }
 
 export async function showPetContextMenu(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("show_pet_context_menu");
 }
 
@@ -742,13 +703,11 @@ export type DialogueState = {
 
 export async function setAppLocale(locale: "zh-CN" | "en-US"): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("set_app_locale", { locale });
 }
 
 export async function subscribeToAppLocale(onLocale: (locale: "zh-CN" | "en-US") => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<string>("locale://changed", (event) => {
     if (event.payload === "zh-CN" || event.payload === "en-US") onLocale(event.payload);
   });
@@ -765,13 +724,11 @@ export type PetRuntimeLoopBoundaryEvent = PetRuntimeAnimationEndEvent & {
 
 export async function showPetDialogue(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("show_pet_dialogue");
 }
 
 export async function hidePetDialogue(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("hide_pet_dialogue");
 }
 
@@ -789,7 +746,6 @@ export async function sendDialogueCommand(command: DialogueCommand): Promise<voi
     window.dispatchEvent(new CustomEvent("wormhole:dialogue-command", { detail: payload }));
     return;
   }
-  const { emit, listen } = await import("@tauri-apps/api/event");
   await new Promise<void>(async (resolve, reject) => {
     let settled = false;
     let timeout = 0;
@@ -817,13 +773,11 @@ export async function sendDialogueCommand(command: DialogueCommand): Promise<voi
 
 export async function acknowledgeDialogueCommand(ack: DialogueCommandAck): Promise<void> {
   if (!isTauri()) return;
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("dialogue://command-ack", ack);
 }
 
 export async function publishDialogueState(state: DialogueState): Promise<void> {
   if (!isTauri()) return;
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("dialogue://state", state);
 }
 
@@ -841,7 +795,6 @@ export async function subscribeToDialogueCommand(onCommand: (command: DialogueCo
     window.addEventListener("wormhole:dialogue-command", listener);
     return () => window.removeEventListener("wormhole:dialogue-command", listener);
   }
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<Partial<DialogueCommand> & { text: string }>("dialogue://command", (event) => onCommand({
     text: event.payload.text,
     connectorId: event.payload.connectorId ?? "local",
@@ -852,7 +805,6 @@ export async function subscribeToDialogueCommand(onCommand: (command: DialogueCo
 
 export async function subscribeToDialogueState(onState: (state: DialogueState) => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<DialogueState>("dialogue://state", (event) => onState(event.payload));
 }
 
@@ -861,7 +813,6 @@ export async function publishPetRuntimeSignal(signal: PetSignalEvent): Promise<v
     window.dispatchEvent(new CustomEvent("wormhole:pet-runtime-signal", { detail: signal }));
     return;
   }
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("pet://runtime/signal", signal);
 }
 
@@ -871,7 +822,6 @@ export async function subscribeToPetRuntimeSignal(onSignal: (signal: PetSignalEv
     window.addEventListener("wormhole:pet-runtime-signal", listener);
     return () => window.removeEventListener("wormhole:pet-runtime-signal", listener);
   }
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetSignalEvent>("pet://runtime/signal", (event) => onSignal(event.payload));
 }
 
@@ -880,7 +830,6 @@ export async function publishPetRuntimeState(state: PetRuntimeSnapshot): Promise
     window.dispatchEvent(new CustomEvent("wormhole:pet-runtime-state", { detail: state }));
     return;
   }
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("pet://runtime/state", state);
 }
 
@@ -890,7 +839,6 @@ export async function subscribeToPetRuntimeState(onState: (state: PetRuntimeSnap
     window.addEventListener("wormhole:pet-runtime-state", listener);
     return () => window.removeEventListener("wormhole:pet-runtime-state", listener);
   }
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetRuntimeSnapshot>("pet://runtime/state", (event) => onState(event.payload));
 }
 
@@ -899,7 +847,6 @@ export async function publishPetRuntimeMarker(marker: PetMarkerEvent): Promise<v
     window.dispatchEvent(new CustomEvent("wormhole:pet-runtime-marker", { detail: marker }));
     return;
   }
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("pet://runtime/marker", marker);
 }
 
@@ -909,7 +856,6 @@ export async function subscribeToPetRuntimeMarker(onMarker: (marker: PetMarkerEv
     window.addEventListener("wormhole:pet-runtime-marker", listener);
     return () => window.removeEventListener("wormhole:pet-runtime-marker", listener);
   }
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetMarkerEvent>("pet://runtime/marker", (event) => onMarker(event.payload));
 }
 
@@ -918,7 +864,6 @@ export async function publishPetRuntimeAnimationEnd(event: PetRuntimeAnimationEn
     window.dispatchEvent(new CustomEvent("wormhole:pet-runtime-animation-end", { detail: event }));
     return;
   }
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("pet://runtime/animation-end", event);
 }
 
@@ -928,7 +873,6 @@ export async function subscribeToPetRuntimeAnimationEnd(onEnd: (event: PetRuntim
     window.addEventListener("wormhole:pet-runtime-animation-end", listener);
     return () => window.removeEventListener("wormhole:pet-runtime-animation-end", listener);
   }
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetRuntimeAnimationEndEvent>("pet://runtime/animation-end", (event) => onEnd(event.payload));
 }
 
@@ -937,7 +881,6 @@ export async function publishPetRuntimeLoopBoundary(event: PetRuntimeLoopBoundar
     window.dispatchEvent(new CustomEvent("wormhole:pet-runtime-loop-boundary", { detail: event }));
     return;
   }
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("pet://runtime/loop-boundary", event);
 }
 
@@ -947,7 +890,6 @@ export async function subscribeToPetRuntimeLoopBoundary(onBoundary: (event: PetR
     window.addEventListener("wormhole:pet-runtime-loop-boundary", listener);
     return () => window.removeEventListener("wormhole:pet-runtime-loop-boundary", listener);
   }
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetRuntimeLoopBoundaryEvent>("pet://runtime/loop-boundary", (event) => onBoundary(event.payload));
 }
 
@@ -956,7 +898,6 @@ export async function requestPetRuntimeState(): Promise<void> {
     window.dispatchEvent(new CustomEvent("wormhole:pet-runtime-request-state"));
     return;
   }
-  const { emit } = await import("@tauri-apps/api/event");
   await emit("pet://runtime/request-state");
 }
 
@@ -965,13 +906,11 @@ export async function subscribeToPetRuntimeStateRequests(onRequest: () => void) 
     window.addEventListener("wormhole:pet-runtime-request-state", onRequest);
     return () => window.removeEventListener("wormhole:pet-runtime-request-state", onRequest);
   }
-  const { listen } = await import("@tauri-apps/api/event");
   return listen("pet://runtime/request-state", onRequest);
 }
 
 async function subscribeToUiEvent(eventName: string, onEvent: () => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen(eventName, onEvent);
 }
 
@@ -1010,19 +949,16 @@ export async function setWindowLogicalPosition(position: WindowLogicalPosition):
 
 export async function getCursorPosition(): Promise<{ x: number; y: number }> {
   if (!isTauri()) return { x: 0, y: 0 };
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<{ x: number; y: number }>("cursor_position");
 }
 
 export async function enterRestMode(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("window_action", { action: "enter_rest" });
 }
 
 export async function exitRestMode(): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("window_action", { action: "exit_rest" });
 }
 
@@ -1030,13 +966,11 @@ export type PetLayer = "normal" | "bottom" | "top";
 
 export async function setPetVisibility(visible: boolean): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("pet_visibility", { visible });
 }
 
 export async function subscribeToPetVisibilityChanged(onVisible: (visible: boolean) => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<boolean | { visible: boolean }>("pet://visibility-changed", (event) => {
     onVisible(typeof event.payload === "boolean" ? event.payload : event.payload.visible);
   });
@@ -1044,13 +978,11 @@ export async function subscribeToPetVisibilityChanged(onVisible: (visible: boole
 
 export async function setPetLayer(layer: PetLayer): Promise<void> {
   if (!isTauri()) return;
-  const { invoke } = await import("@tauri-apps/api/core");
   await invoke("pet_layer", { layer });
 }
 
 export async function subscribeToPetLayerChanged(onLayer: (layer: PetLayer) => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetLayer | { layer: PetLayer }>("pet://layer-changed", (event) => {
     const layer = typeof event.payload === "string" ? event.payload : event.payload.layer;
     if (layer === "normal" || layer === "bottom" || layer === "top") onLayer(layer);
@@ -1078,24 +1010,20 @@ export const subscribeToWindowFileDrop = subscribeToPetFileDrop;
 
 export async function feedFilesToPet(paths: string[]): Promise<PetFeedResult> {
   if (!isTauri()) return { names: paths.map((path) => path.split(/[\\/]/).pop() ?? path), count: paths.length };
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<PetFeedResult>("feed_files", { paths });
 }
 
 export async function undoLastPetFeed(): Promise<PetFeedResult> {
   if (!isTauri()) return { names: [], count: 0 };
-  const { invoke } = await import("@tauri-apps/api/core");
   return invoke<PetFeedResult>("undo_last_feed");
 }
 
 export async function subscribeToPetFeed(onFeed: (result: PetFeedResult) => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetFeedResult>("pet://fed", (event) => onFeed(event.payload));
 }
 
 export async function subscribeToPetRestore(onRestore: (result: PetFeedResult) => void) {
   if (!isTauri()) return () => undefined;
-  const { listen } = await import("@tauri-apps/api/event");
   return listen<PetFeedResult>("pet://restored", (event) => onRestore(event.payload));
 }
