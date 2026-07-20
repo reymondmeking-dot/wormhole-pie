@@ -98,10 +98,21 @@ GitHub 仓库的 Actions 页面支持手动运行 `Build Wormhole Pie Installers
 
 ## 开发运行
 
+带热更新的桌面 Debug 模式（推荐）：
+
 ```powershell
 pnpm install
-pnpm tauri dev
+pnpm debug
 ```
+
+需要一个不依赖 `localhost:1420`、可直接双击运行的独立 Debug EXE：
+
+```powershell
+pnpm debug:standalone
+& '.\src-tauri\target\debug\wormhole-pie.exe'
+```
+
+不要使用 `cargo run`、`cargo build` 或 IDE 的普通 Rust 启动按钮来生成桌面 Debug 版。这些方式会绕过 Tauri CLI：Debug WebView 会指向 `http://localhost:1420`，但 Vite 没有启动，因此会出现 `ERR_CONNECTION_REFUSED`。`pnpm debug` 会自动管理 Vite；`pnpm debug:standalone` 则会把 `dist` 前端资源嵌入 Debug EXE。
 
 仅运行浏览器预览：
 

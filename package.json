@@ -5,6 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "debug": "tauri dev",
+    "debug:standalone": "tauri build --debug --no-bundle",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
